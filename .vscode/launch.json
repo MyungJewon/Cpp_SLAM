@@ -1,0 +1,14 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run SLAM",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/slam",
+            "args": ["${workspaceFolder}/PLY/points3D.ply"],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "Build SLAM"
+        }
+    ]
+}

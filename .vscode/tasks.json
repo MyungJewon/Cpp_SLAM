@@ -11,6 +11,8 @@
                 "main.cpp",
                 "PlyParser.cpp",
                 "KDTree.cpp",
+                "ICP.cpp",
+                "VoxelGrid.cpp",
                 "-o",
                 "slam"
             ],

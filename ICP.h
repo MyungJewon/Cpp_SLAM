@@ -1,0 +1,28 @@
+// ICP 선언: 두 포인트 클라우드를 정렬해 이동/회전을 추정합니다.
+#pragma once
+#include <array>
+#include <vector>
+#include "KDTree.h"
+
+// 3x3 행렬을 1차원 배열로 표현 (row-major)
+// [0][1][2]
+// [3][4][5]
+// [6][7][8]
+using Matrix3x3 = std::array<float, 9>;
+
+// ICP 결과: 회전행렬 R과 이동벡터 t
+struct ICPResult
+{
+    Matrix3x3            R;          // 회전행렬
+    std::array<float, 3> t;          // 이동벡터
+    int                  iterations; // 실제 반복 횟수
+    float                error;      // 최종 오차
+};
+
+// src를 dst에 맞추는 ICP 실행
+// maxIterations: 최대 반복 횟수
+// tolerance: 이 오차 이하면 수렴으로 판단하고 조기 종료
+ICPResult runICP(const std::vector<std::array<float, 3>>& src,
+                 const std::vector<std::array<float, 3>>& dst,
+                 int   maxIterations = 50,
+                 float tolerance     = 1e-6f);

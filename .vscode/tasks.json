@@ -13,6 +13,10 @@
                 "KDTree.cpp",
                 "ICP.cpp",
                 "VoxelGrid.cpp",
+                "Odometry.cpp",
+                "LoopCloser.cpp",
+                "MapBuilder.cpp",
+                "BagParser.cpp",
                 "-o",
                 "slam"
             ],

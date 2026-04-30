@@ -1,5 +1,6 @@
-// KD-Tree, ICP, Voxel Grid Filter 테스트 진입점
+// KD-Tree, ICP, Voxel Grid Filter, Odometry, Loop Closure, Map Builder, Bag Parser 테스트 진입점
 #include <iostream>
+#include <fstream>
 #include <array>
 #include <vector>
 #include <cmath>
@@ -10,6 +11,101 @@
 #include "KDTree.h"
 #include "ICP.h"
 #include "VoxelGrid.h"
+#include "Odometry.h"
+#include "LoopCloser.h"
+#include "MapBuilder.h"
+#include "BagParser.h"
+
+// ── 경로를 색상 그라디언트 PLY로 저장 (초록=시작, 빨강=끝) ──────────
+void saveTrajectoryPly(const std::vector<std::array<float, 3>>& traj,
+                        const std::string& path)
+{
+    std::ofstream f(path);
+    f << "ply\nformat ascii 1.0\n"
+      << "element vertex " << traj.size() << "\n"
+      << "property float x\nproperty float y\nproperty float z\n"
+      << "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+      << "end_header\n";
+
+    int n = (int)traj.size();
+    for (int i = 0; i < n; ++i)
+    {
+        float ratio = (n > 1) ? (float)i / (n - 1) : 0.0f;
+        int r = (int)(ratio * 255);
+        int g = (int)((1.0f - ratio) * 255);
+        f << traj[i][0] << " " << traj[i][1] << " " << traj[i][2]
+          << " " << r << " " << g << " 50\n";
+    }
+    std::cout << "[Visualizer] 경로 PLY 저장: " << path
+              << " (" << n << "개 점)" << std::endl;
+}
+
+// ── 2D 탑다운 이미지 저장 (PPM 포맷 — 라이브러리 없음) ──────────────
+// 맵 점은 청회색, 경로는 초록→빨강 그라디언트로 그려요.
+// macOS에서는 미리보기(Preview.app)로 바로 열 수 있어요.
+void saveMapImage(const std::vector<std::array<float, 3>>& traj,
+                  const std::vector<std::array<float, 3>>& mapPts,
+                  const std::string& path, int imgSize = 1024)
+{
+    if (traj.empty()) return;
+
+    // 바운딩 박스 (경로 + 맵 점 모두 포함)
+    float minX = traj[0][0], maxX = traj[0][0];
+    float minY = traj[0][1], maxY = traj[0][1];
+    for (const auto& p : traj)   { minX=std::min(minX,p[0]); maxX=std::max(maxX,p[0]);
+                                    minY=std::min(minY,p[1]); maxY=std::max(maxY,p[1]); }
+    for (const auto& p : mapPts) { minX=std::min(minX,p[0]); maxX=std::max(maxX,p[0]);
+                                    minY=std::min(minY,p[1]); maxY=std::max(maxY,p[1]); }
+
+    float range = std::max(maxX - minX, maxY - minY) * 1.1f + 0.1f;
+    float cx = (minX + maxX) / 2.0f;
+    float cy = (minY + maxY) / 2.0f;
+
+    // 좌표 → 픽셀 (y축 반전: 화면 위 = 월드 위)
+    auto toPixel = [&](float x, float y) -> std::pair<int,int> {
+        int px = (int)((x - cx) / range * imgSize + imgSize * 0.5f);
+        int py = (int)(-(y - cy) / range * imgSize + imgSize * 0.5f);
+        return { std::max(0, std::min(imgSize-1, px)),
+                 std::max(0, std::min(imgSize-1, py)) };
+    };
+
+    // 배경: 어두운 회색
+    std::vector<uint8_t> buf(imgSize * imgSize * 3, 25);
+
+    // 맵 점: 청회색
+    for (const auto& p : mapPts)
+    {
+        auto [x, y] = toPixel(p[0], p[1]);
+        int idx = (y * imgSize + x) * 3;
+        buf[idx] = 60; buf[idx+1] = 70; buf[idx+2] = 80;
+    }
+
+    // 경로: 초록(시작) → 빨강(끝), 3×3 점으로 굵게
+    int n = (int)traj.size();
+    for (int i = 0; i < n; ++i)
+    {
+        auto [x, y] = toPixel(traj[i][0], traj[i][1]);
+        float ratio = (n > 1) ? (float)i / (n - 1) : 0.0f;
+        uint8_t r = (uint8_t)(ratio * 255);
+        uint8_t g = (uint8_t)((1.0f - ratio) * 200 + 55);
+        for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx)
+        {
+            int nx = std::max(0, std::min(imgSize-1, x+dx));
+            int ny = std::max(0, std::min(imgSize-1, y+dy));
+            int idx = (ny * imgSize + nx) * 3;
+            buf[idx] = r; buf[idx+1] = g; buf[idx+2] = 50;
+        }
+    }
+
+    // PPM P6 (바이너리) 저장
+    std::ofstream f(path, std::ios::binary);
+    f << "P6\n" << imgSize << " " << imgSize << "\n255\n";
+    f.write(reinterpret_cast<const char*>(buf.data()), (std::streamsize)buf.size());
+    std::cout << "[Visualizer] 2D 맵 이미지 저장: " << path
+              << " (" << imgSize << "x" << imgSize << "px)" << std::endl;
+    std::cout << "             → macOS Finder에서 더블클릭하면 미리보기로 열려요" << std::endl;
+}
 
 // 포인트 클라우드에서 KD-Tree에 넣을 형태로 변환
 std::vector<std::array<float, 3>> extractPoints(const PointCloud& cloud)
@@ -174,6 +270,245 @@ int main(int argc, char* argv[])
     std::cout << "ICP 소요시간: "
               << std::chrono::duration_cast<std::chrono::milliseconds>(icpEnd - icpStart).count()
               << "ms" << std::endl;
+
+    // ── Odometry 테스트 ──────────────────────────────────
+    // 실제 센서가 없으니 PLY 포인트 클라우드를 매 프레임마다
+    // 조금씩 이동시켜서 연속 프레임처럼 흉내냅니다.
+    // 5프레임 동안 x축으로 0.05m씩 이동하는 상황을 시뮬레이션해요.
+
+    std::cout << "\n--- Odometry 테스트 ---" << std::endl;
+    std::cout << "시뮬레이션: 5프레임, 매 프레임 x축 +0.05m 이동" << std::endl;
+
+    Odometry odom(0.3f);
+
+    // 프레임 0: 원본 그대로 (시작 위치)
+    odom.addFrame(points);
+
+    // 프레임 1~4: x축으로 0.05m씩 누적 이동
+    for (int frame = 1; frame <= 4; ++frame)
+    {
+        float offsetX = 0.05f * frame;
+
+        std::vector<std::array<float, 3>> shifted;
+        shifted.reserve(points.size());
+        for (const auto& p : points)
+            shifted.push_back({ p[0] + offsetX, p[1], p[2] });
+
+        odom.addFrame(shifted);
+    }
+
+    // 최종 위치 출력
+    auto finalPos = odom.getPosition();
+    std::cout << "\n--- Odometry 결과 ---" << std::endl;
+    std::cout << "예상 최종 위치 : (0.2, 0, 0)" << std::endl;
+    std::cout << "추정 최종 위치 : ("
+              << finalPos[0] << ", "
+              << finalPos[1] << ", "
+              << finalPos[2] << ")" << std::endl;
+
+    std::cout << "\n경로 기록:" << std::endl;
+    const auto& traj = odom.getTrajectory();
+    for (int i = 0; i < (int)traj.size(); ++i)
+        std::cout << "  프레임 " << i << " : ("
+                  << traj[i][0] << ", "
+                  << traj[i][1] << ", "
+                  << traj[i][2] << ")" << std::endl;
+
+    // ── Loop Closure 테스트 ───────────────────────────────
+    // 시뮬레이션: x축으로 이동했다가 다시 출발점 근처로 돌아오는 경로
+    // 프레임 0~4: x축 +0.05m씩 전진 (Odometry와 동일)
+    // 프레임 5~8: x축 -0.05m씩 복귀 → 출발점 근처로 돌아옴
+    // Loop Closer가 돌아온 시점을 감지하고 경로를 보정해야 해요.
+
+    std::cout << "\n--- Loop Closure 테스트 ---" << std::endl;
+    std::cout << "시뮬레이션: 전진 5프레임 → 복귀 4프레임 (루프 경로)" << std::endl;
+
+    Odometry    odom2(0.3f);
+    LoopCloser  loopCloser(0.08f, 0.05f, 3);
+
+    auto ds_points = voxelGridFilter(points, 0.3f);
+
+    // 전진 구간 (프레임 0~4)
+    for (int frame = 0; frame <= 4; ++frame)
+    {
+        float offsetX = 0.05f * frame;
+        std::vector<std::array<float, 3>> shifted;
+        shifted.reserve(points.size());
+        for (const auto& p : points)
+            shifted.push_back({ p[0] + offsetX, p[1], p[2] });
+
+        odom2.addFrame(shifted);
+
+        auto pos    = odom2.getPosition();
+        auto ds_pts = voxelGridFilter(shifted, 0.3f);
+        loopCloser.addKeyFrame(frame, pos, ds_pts);
+    }
+
+    // 복귀 구간 (프레임 5~8): 출발점 방향으로 돌아옴
+    for (int frame = 5; frame <= 8; ++frame)
+    {
+        float offsetX = 0.05f * (8 - frame);  // 점점 0으로 줄어듦
+        std::vector<std::array<float, 3>> shifted;
+        shifted.reserve(points.size());
+        for (const auto& p : points)
+            shifted.push_back({ p[0] + offsetX, p[1], p[2] });
+
+        odom2.addFrame(shifted);
+
+        auto pos     = odom2.getPosition();
+        auto ds_pts  = voxelGridFilter(shifted, 0.3f);
+
+        // 루프 감지 시도
+        // trajectory는 복사본 — detect()가 보정한 결과를 corrected에 저장
+        auto corrected = odom2.getTrajectory();
+        bool loopFound = loopCloser.detect(pos, ds_pts, corrected);
+
+        if (!loopFound)
+            loopCloser.addKeyFrame(frame, pos, ds_pts);
+        else
+        {
+            std::cout << "[Loop Closure] 경로 보정 완료" << std::endl;
+
+            // 보정 전후 경로 비교 출력
+            std::cout << "\n--- Loop Closure 결과 ---" << std::endl;
+            std::cout << "보정 전 최종 위치 : ("
+                      << pos[0] << ", " << pos[1] << ", " << pos[2] << ")" << std::endl;
+            std::cout << "보정 후 최종 위치 : ("
+                      << corrected.back()[0] << ", "
+                      << corrected.back()[1] << ", "
+                      << corrected.back()[2] << ")" << std::endl;
+            std::cout << "예상 최종 위치   : (0, 0, 0)" << std::endl;
+
+            std::cout << "\n보정된 경로:" << std::endl;
+            for (int i = 0; i < (int)corrected.size(); ++i)
+                std::cout << "  프레임 " << i << " : ("
+                          << corrected[i][0] << ", "
+                          << corrected[i][1] << ", "
+                          << corrected[i][2] << ")" << std::endl;
+            break;
+        }
+    }
+
+
+    // ── Map Builder 테스트 ───────────────────────────────
+    // Odometry로 위치를 추적하면서 동시에 MapBuilder로 전역 맵을 누적해요.
+    // 5프레임 전진하면서 각 프레임 포인트를 전역 좌표로 변환해 맵에 쌓고
+    // 최종적으로 PLY 파일로 저장해요.
+
+    std::cout << "\n--- Map Builder 테스트 ---" << std::endl;
+    std::cout << "시뮬레이션: 5프레임 전진하며 전역 맵 누적" << std::endl;
+
+    Odometry   odom3(0.3f);
+    MapBuilder mapBuilder(0.3f, 5);
+
+    for (int frame = 0; frame <= 4; ++frame)
+    {
+        float offsetX = 0.05f * frame;
+
+        // 현재 프레임 포인트 생성
+        std::vector<std::array<float, 3>> shifted;
+        shifted.reserve(points.size());
+        for (const auto& p : points)
+            shifted.push_back({ p[0] + offsetX, p[1], p[2] });
+
+        // Odometry로 위치 추적
+        odom3.addFrame(shifted);
+
+        // MapBuilder에 현재 프레임 추가
+        auto ds_pts = voxelGridFilter(shifted, 0.3f);
+        mapBuilder.addFrame(ds_pts, odom3.getRotation(), odom3.getPosition());
+
+        std::cout << "[MapBuilder] 프레임 " << frame
+                  << " | 맵 점 개수: " << mapBuilder.getPointCount()
+                  << std::endl;
+    }
+
+    // 최종 맵 저장
+    std::cout << "\n--- Map Builder 결과 ---" << std::endl;
+    std::cout << "최종 맵 점 개수: " << mapBuilder.getPointCount() << std::endl;
+    mapBuilder.saveToPly("output_map.ply");
+
+    // ── Bag Parser + SLAM 파이프라인 ─────────────────────
+    // 실제 LiDAR bag 파일을 프레임별로 읽어서
+    // Odometry로 위치를 추적하고 MapBuilder로 전역 맵을 생성해요.
+
+    std::cout << "\n--- Bag Parser + SLAM ---" << std::endl;
+
+    BagParser  bag("/Users/deepfine/Downloads/T3F2-2021-08-02-15-00-12.bag", "/velodyne_points");
+    Odometry   bagOdom(0.3f);
+    MapBuilder bagMap(0.3f, 10);
+
+    // 지면 구속: 평지 데이터 → z=0 고정, Yaw만 추적
+    bagOdom.setGroundMode(true);
+
+    // 루프 클로저: 반경 3m 안에 50 키프레임 이상 차이 나는 과거 위치 발견 시 보정
+    // (5프레임마다 키프레임 추가 → 50 키프레임 = 250 프레임 ≈ 25초 간격)
+    LoopCloser bagLoopCloser(3.0f, 0.15f, 50);
+    int keyFrameId = 0;
+    int loopCount  = 0;
+
+    if (!bag.open())
+    {
+        std::cout << "bag 파일 열기 실패" << std::endl;
+        return -1;
+    }
+
+    std::vector<std::array<float, 3>> framePoints;
+    int frameIdx = 0;
+
+    while (bag.nextFrame(framePoints))
+    {
+        // 1. Odometry로 위치 추적
+        bagOdom.addFrame(framePoints);
+        auto pos = bagOdom.getPosition();
+
+        // 2. 전역 맵에 추가
+        auto ds = voxelGridFilter(framePoints, 0.3f);
+        bagMap.addFrame(ds, bagOdom.getRotation(), pos);
+
+        // 3. 5프레임마다 루프 클로저 시도
+        if (frameIdx % 5 == 0)
+        {
+            auto corrected = bagOdom.getTrajectory();
+            if (bagLoopCloser.detect(pos, ds, corrected))
+            {
+                bagOdom.setTrajectory(corrected);
+                bagOdom.setPosition(corrected.back());
+                ++loopCount;
+                std::cout << "[SLAM] ✅ 루프 클로저 보정! (누적 " << loopCount << "회)" << std::endl;
+            }
+            else
+            {
+                bagLoopCloser.addKeyFrame(keyFrameId++, pos, ds);
+            }
+        }
+
+        std::cout << "[SLAM] 프레임 " << frameIdx
+                  << " | 점 개수: "   << framePoints.size()
+                  << " | 위치: ("     << pos[0] << ", "
+                                      << pos[1] << ", "
+                                      << pos[2] << ")"
+                  << " | 맵 크기: "   << bagMap.getPointCount()
+                  << std::endl;
+
+        ++frameIdx;
+    }
+
+    bag.close();
+
+    // 결과 저장
+    bagMap.saveToPly("slam_map.ply");
+    saveTrajectoryPly(bagOdom.getTrajectory(), "slam_trajectory.ply");
+    saveMapImage(bagOdom.getTrajectory(), bagMap.getMap(), "slam_map_2d.ppm");
+
+    std::cout << "\n--- SLAM 결과 ---" << std::endl;
+    std::cout << "처리 프레임 수  : " << frameIdx << std::endl;
+    std::cout << "루프 클로저 횟수: " << loopCount << std::endl;
+    std::cout << "최종 맵 점 개수 : " << bagMap.getPointCount() << std::endl;
+    std::cout << "최종 위치       : ("
+              << bagOdom.getPosition()[0] << ", "
+              << bagOdom.getPosition()[1] << ", "
+              << bagOdom.getPosition()[2] << ")" << std::endl;
 
     return 0;
 }

@@ -20,9 +20,12 @@ struct ICPResult
 };
 
 // src를 dst에 맞추는 ICP 실행
-// maxIterations: 최대 반복 횟수
-// tolerance: 이 오차 이하면 수렴으로 판단하고 조기 종료
+// initialR / initialT: ICP 시작 전 적용할 초기 변환 (IMU 예측값 등)
+//                      nullptr이면 항등변환으로 시작
 ICPResult runICP(const std::vector<std::array<float, 3>>& src,
                  const std::vector<std::array<float, 3>>& dst,
-                 int   maxIterations = 50,
-                 float tolerance     = 1e-6f);
+                 int              maxIterations = 20,
+                 float            tolerance     = 1e-4f,
+                 const Matrix3x3* initialR      = nullptr,
+                 const std::array<float, 3>* initialT = nullptr,
+                 bool             usePointToPlane = false);

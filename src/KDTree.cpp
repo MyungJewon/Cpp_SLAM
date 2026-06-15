@@ -21,11 +21,14 @@ void KDTree::clear(KDNode* node)
 // ── 트리 구축 ────────────────────────────────────────
 void KDTree::build(const std::vector<std::array<float, 3>>& points)
 {
-    std::vector<std::array<float, 3>> pts(points);
+    std::vector<IndexedPoint> pts;
+    pts.reserve(points.size());
+    for (int i = 0; i < (int)points.size(); ++i)
+        pts.push_back({points[i], i});
     root = buildRecursive(pts, 0);
 }
 
-KDNode* KDTree::buildRecursive(std::vector<std::array<float, 3>> points, int depth)
+KDNode* KDTree::buildRecursive(std::vector<IndexedPoint> points, int depth)
 {
     if (points.empty()) return nullptr;
 
@@ -34,19 +37,20 @@ KDNode* KDTree::buildRecursive(std::vector<std::array<float, 3>> points, int dep
 
     // 해당 축 기준으로 정렬 후 중간값을 이 노드로 선택
     std::sort(points.begin(), points.end(),
-        [axis](const std::array<float, 3>& a, const std::array<float, 3>& b) {
-            return a[axis] < b[axis];
+        [axis](const IndexedPoint& a, const IndexedPoint& b) {
+            return a.point[axis] < b.point[axis];
         });
 
     int mid = points.size() / 2;
 
     KDNode* node  = new KDNode();
-    node->point   = points[mid];
+    node->point   = points[mid].point;
+    node->index   = points[mid].index;
     node->left    = buildRecursive(
-                        std::vector<std::array<float, 3>>(points.begin(), points.begin() + mid),
+                        std::vector<IndexedPoint>(points.begin(), points.begin() + mid),
                         depth + 1);
     node->right   = buildRecursive(
-                        std::vector<std::array<float, 3>>(points.begin() + mid + 1, points.end()),
+                        std::vector<IndexedPoint>(points.begin() + mid + 1, points.end()),
                         depth + 1);
 
     return node;
@@ -59,6 +63,14 @@ std::array<float, 3> KDTree::nearest(const std::array<float, 3>& query) const
     float bestDist  = std::numeric_limits<float>::max();
     nearestRecursive(root, query, 0, best, bestDist);
     return best->point;
+}
+
+int KDTree::nearestIdx(const std::array<float, 3>& query) const
+{
+    KDNode* best    = nullptr;
+    float bestDist  = std::numeric_limits<float>::max();
+    nearestRecursive(root, query, 0, best, bestDist);
+    return best ? best->index : -1;
 }
 
 void KDTree::nearestRecursive(KDNode* node, const std::array<float, 3>& query,

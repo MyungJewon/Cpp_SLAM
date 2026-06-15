@@ -7,6 +7,7 @@
 struct KDNode
 {
     std::array<float, 3> point;  // x, y, z
+    int index = -1;              // 원본 배열에서의 인덱스
     KDNode* left  = nullptr;
     KDNode* right = nullptr;
 };
@@ -23,10 +24,19 @@ public:
     // query와 가장 가까운 점을 반환
     std::array<float, 3> nearest(const std::array<float, 3>& query) const;
 
+    // query와 가장 가까운 점의 원본 배열 인덱스를 반환
+    int nearestIdx(const std::array<float, 3>& query) const;
+
 private:
+    struct IndexedPoint
+    {
+        std::array<float, 3> point;
+        int index;
+    };
+
     KDNode* root;
 
-    KDNode* buildRecursive(std::vector<std::array<float, 3>> points, int depth);
+    KDNode* buildRecursive(std::vector<IndexedPoint> points, int depth);
     void nearestRecursive(KDNode* node, const std::array<float, 3>& query,
                           int depth, KDNode*& best, float& bestDist) const;
     void clear(KDNode* node);

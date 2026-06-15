@@ -1,15 +1,10 @@
-# 빌드 결과물
-slam
+# 빌드
+build/
 *.o
-
-# macOS 디버그 심볼
 *.dSYM/
 
-# macOS 시스템 파일
-.DS_Store
+# 실행 결과물
+output/
 
-# VS Code 설정 (선택적)
-# .vscode/
-slam_map.ply
-slam_map_2d.ppm
-slam_trajectory.ply
+# macOS
+.DS_Store

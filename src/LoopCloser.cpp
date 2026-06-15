@@ -55,7 +55,15 @@ bool LoopCloser::detect(const std::array<float, 3>&              currentPos,
     // 2. 후보마다 ICP 실행해서 루프 확인
     for (const auto* kf : candidates)
     {
-        ICPResult icp = runICP(currentPoints, kf->points);
+        // 키프레임 위치 기준으로 초기 translation 설정
+        // 두 스캔 모두 로컬 좌표이므로 위치 차이를 초기값으로 넘겨 수렴 가능성을 높임
+        Matrix3x3 initR = {1,0,0, 0,1,0, 0,0,1};
+        std::array<float,3> initT = {
+            kf->position[0] - currentPos[0],
+            kf->position[1] - currentPos[1],
+            kf->position[2] - currentPos[2]
+        };
+        ICPResult icp = runICP(currentPoints, kf->points, 30, 1e-4f, &initR, &initT, true);
 
         std::cout << "[LoopCloser] 프레임 " << kf->index
                   << " ICP 오차: " << icp.error << std::endl;
@@ -63,13 +71,14 @@ bool LoopCloser::detect(const std::array<float, 3>&              currentPos,
         if (icp.error < _icpThreshold)
         {
             // 3. 루프 감지 — 경로 보정
-            // Odometry가 추정한 현재 위치와 키프레임 위치의 차이가 누적 오차
-            // icp.t는 두 포인트 클라우드가 얼마나 다른지를 나타내므로 제외하고
-            // 순수하게 위치 차이만으로 drift를 계산해요
+            // ICP가 현재 포인트 클라우드를 키프레임 클라우드로 정렬하면서
+            // 구한 이동량(icp.t)이 두 위치 사이의 실제 기하 오프셋입니다.
+            // 이전 구현은 icp.t를 버리고 위치 차이만 썼는데,
+            // icp.t를 반영해야 Odometry 드리프트가 정확히 제거됩니다.
             std::array<float, 3> drift = {
-                currentPos[0] - kf->position[0],
-                currentPos[1] - kf->position[1],
-                currentPos[2] - kf->position[2]
+                currentPos[0] - kf->position[0] - icp.t[0],
+                currentPos[1] - kf->position[1] - icp.t[1],
+                currentPos[2] - kf->position[2] - icp.t[2]
             };
 
             std::cout << "[LoopCloser] 루프 감지! 프레임 " << kf->index

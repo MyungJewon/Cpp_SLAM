@@ -5,6 +5,13 @@
 #include <string>
 #include "ICP.h"
 #include "VoxelGrid.h"
+#include "PoseGraph.h"
+
+struct KeyFrameData
+{
+    std::vector<std::array<float, 3>> localPoints;
+    Pose3D pose;
+};
 
 class MapBuilder
 {
@@ -27,6 +34,12 @@ public:
     // 맵 전체 반환
     const std::vector<std::array<float, 3>>& getMap() const;
 
+    void storeKeyFramePoints(int keyFrameId,
+                             const std::vector<std::array<float, 3>>& localPoints,
+                             const Pose3D& pose);
+
+    void rebuildFromPoses(const std::vector<Pose3D>& optimizedPoses);
+
     // 맵을 PLY 파일로 저장 (ASCII 포맷)
     bool saveToPly(const std::string& filePath) const;
 
@@ -36,4 +49,5 @@ private:
     int   _frameCount;
 
     std::vector<std::array<float, 3>> _map;
+    std::vector<KeyFrameData> _keyFrameData;
 };

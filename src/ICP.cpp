@@ -1,11 +1,9 @@
-// ICP 구현: 두 포인트 클라우드를 반복적으로 정렬해 이동/회전을 추정합니다.
 #include "ICP.h"
 #include <algorithm>
 #include <cmath>
 #include <numeric>
 #include <limits>
 
-// ── 행렬 × 행렬 ─────────────────────────────────────
 static Matrix3x3 multiplyMat(const Matrix3x3& A, const Matrix3x3& B)
 {
     Matrix3x3 C = {};
@@ -16,7 +14,6 @@ static Matrix3x3 multiplyMat(const Matrix3x3& A, const Matrix3x3& B)
     return C;
 }
 
-// ── 행렬 × 벡터 ─────────────────────────────────────
 static std::array<float, 3> multiplyVec(const Matrix3x3& R, const std::array<float, 3>& v)
 {
     return {
@@ -61,7 +58,6 @@ static Matrix3x3 rodrigues(const std::array<float, 3>& w)
     return R;
 }
 
-// ── 중심점 계산 ──────────────────────────────────────
 static std::array<float, 3> computeCentroid(const std::vector<std::array<float, 3>>& pts)
 {
     std::array<float, 3> c = {0, 0, 0};
@@ -284,31 +280,17 @@ static bool computePointToPlaneStep(const std::vector<std::array<float, 3>>& mat
     return true;
 }
 
-// ── SVD로 회전행렬 계산 ─────────────────────────────
-// H = 공분산 행렬 (비대칭), R = V * U^T 를 반환합니다.
-//
-// 이전 구현은 야코비 반복법을 H에 직접 적용했는데,
-// 야코비는 대칭 행렬 전용입니다. H가 비대칭이면 U ≠ V 가 되어
-// 회전행렬이 틀리게 나옵니다.
-//
-// 올바른 방법:
-//   1. M = H^T * H (대칭 PSD) 에 야코비 적용 → 고유벡터 행렬 V 획득
-//   2. U 열 = H * v_i / sigma_i  (sigma_i = sqrt(eigenvalue_i))
-//   3. R = V * U^T,  det < 0 이면 U 마지막 열 부호 반전
 static Matrix3x3 computeSVD(const Matrix3x3& H)
 {
-    // Step 1: M = H^T * H  (대칭 PSD)
     Matrix3x3 Ht = { H[0], H[3], H[6],
                      H[1], H[4], H[7],
                      H[2], H[5], H[8] };
     Matrix3x3 M = multiplyMat(Ht, H);
 
-    // Step 2: 대칭 행렬 M에 야코비 반복 → V, 대각(고유값)
     Matrix3x3 V = {1,0,0, 0,1,0, 0,0,1};
 
     for (int iter = 0; iter < 100; ++iter)
     {
-        // 비대각 원소 중 절대값이 가장 큰 (p,q) 선택
         int p = 0, q = 1;
         float maxOff = std::abs(M[0*3+1]);
         if (std::abs(M[0*3+2]) > maxOff) { maxOff = std::abs(M[0*3+2]); p=0; q=2; }
@@ -334,8 +316,6 @@ static Matrix3x3 computeSVD(const Matrix3x3& H)
         V = multiplyMat(V, J);
     }
 
-    // Step 3: U 열 계산  u_i = H * v_i / sigma_i
-    // V 열 벡터: V[row*3 + col]  →  v_i = (V[0,i], V[1,i], V[2,i])
     Matrix3x3 U = {};
     for (int i = 0; i < 3; ++i)
     {
@@ -350,7 +330,6 @@ static Matrix3x3 computeSVD(const Matrix3x3& H)
         }
         else if (i == 2)
         {
-            // 특이값이 0에 가까운 경우: u0 × u1 로 직교 완성
             std::array<float,3> u0 = { U[0], U[3], U[6] };
             std::array<float,3> u1 = { U[1], U[4], U[7] };
             ui = { u0[1]*u1[2] - u0[2]*u1[1],
@@ -362,13 +341,11 @@ static Matrix3x3 computeSVD(const Matrix3x3& H)
         U[2*3+i] = ui[2];
     }
 
-    // Step 4: R = V * U^T
     Matrix3x3 Ut = { U[0], U[3], U[6],
                      U[1], U[4], U[7],
                      U[2], U[5], U[8] };
     Matrix3x3 R = multiplyMat(V, Ut);
 
-    // Step 5: 반사 보정 — det(R) = -1 이면 U 마지막 열 부호 반전
     float det = R[0]*(R[4]*R[8]-R[5]*R[7])
               - R[1]*(R[3]*R[8]-R[5]*R[6])
               + R[2]*(R[3]*R[7]-R[4]*R[6]);
@@ -387,7 +364,6 @@ static Matrix3x3 computeSVD(const Matrix3x3& H)
     return R;
 }
 
-// ── ICP 메인 루프 ────────────────────────────────────
 ICPResult runICP(const std::vector<std::array<float, 3>>& src,
                  const std::vector<std::array<float, 3>>& dst,
                  int maxIterations, float tolerance,
@@ -399,15 +375,14 @@ ICPResult runICP(const std::vector<std::array<float, 3>>& src,
     result.R = {1,0,0, 0,1,0, 0,0,1};
     result.t = {0, 0, 0};
     result.error = std::numeric_limits<float>::max();
+    result.fitness = 0.0f;
 
-    // dst로 KD-Tree 구축
     KDTree tree;
     tree.build(dst);
     std::vector<std::array<float, 3>> dstNormals;
     if (usePointToPlane)
         dstNormals = estimateNormals(dst);
 
-    // 초기 변환 적용 (IMU 예측값 등)
     std::vector<std::array<float, 3>> current = src;
     if (initialR)
     {
@@ -421,13 +396,10 @@ ICPResult runICP(const std::vector<std::array<float, 3>>& src,
         result.t = t0;
     }
 
-    // 대응점 최대 거리: 복셀 크기의 3배를 기본값으로 사용
-    // 이 거리보다 먼 대응점은 아웃라이어로 버립니다.
-    const float maxDistSq = 1.0f * 1.0f;  // 1.0m (복셀 0.3m 기준 3배)
+    const float maxDistSq = 0.35f * 0.35f;  // 반복 구조물(주차선/기둥) 간 거리보다 좁게 잡아 오매칭 방지
 
     for (int iter = 0; iter < maxIterations; ++iter)
     {
-        // 1. 각 점의 대응점 찾기 — 거리 제한 초과 시 버림
         std::vector<std::array<float, 3>> matchedSrc;
         std::vector<std::array<float, 3>> matchedDst;
         std::vector<std::array<float, 3>> matchedNormals;
@@ -462,12 +434,13 @@ ICPResult runICP(const std::vector<std::array<float, 3>>& src,
             totalError += distSq;
         }
 
-        // 유효 대응점이 너무 적으면 중단
         if (matchedSrc.size() < 10) break;
+
+        result.fitness = current.empty() ? 0.0f
+            : (float)matchedSrc.size() / (float)current.size();
 
         totalError /= matchedSrc.size();
 
-        // 2. 수렴 확인
         if (std::abs(result.error - totalError) < tolerance)
         {
             result.iterations = iter;
@@ -486,11 +459,9 @@ ICPResult runICP(const std::vector<std::array<float, 3>>& src,
         }
         else
         {
-            // 3. 중심점 계산
             auto srcCentroid = computeCentroid(matchedSrc);
             auto dstCentroid = computeCentroid(matchedDst);
 
-            // 4. 공분산 행렬 H 계산
             Matrix3x3 H = {};
             for (int i = 0; i < (int)matchedSrc.size(); ++i)
             {
@@ -505,16 +476,13 @@ ICPResult runICP(const std::vector<std::array<float, 3>>& src,
                     matchedDst[i][2] - dstCentroid[2]
                 };
 
-                // H += ps * pd^T (외적)
                 for (int r = 0; r < 3; ++r)
                     for (int c = 0; c < 3; ++c)
                         H[r*3+c] += ps[r] * pd[c];
             }
 
-            // 5. SVD로 회전행렬 계산
             R = computeSVD(H);
 
-            // 6. 이동벡터 계산
             auto rotatedSrc = multiplyVec(R, srcCentroid);
             t = {
                 dstCentroid[0] - rotatedSrc[0],
@@ -523,7 +491,6 @@ ICPResult runICP(const std::vector<std::array<float, 3>>& src,
             };
         }
 
-        // 7. current에 변환 적용
         for (auto& p : current)
         {
             p = multiplyVec(R, p);
@@ -532,7 +499,6 @@ ICPResult runICP(const std::vector<std::array<float, 3>>& src,
             p[2] += t[2];
         }
 
-        // 8. 누적 변환 갱신
         // 반드시 이전 result.t를 먼저 복사한 뒤 계산해야 해요.
         // 바로 result.t에 쓰면 아직 쓰지 않은 값이 덮어씌워집니다.
         result.R = multiplyMat(R, result.R);

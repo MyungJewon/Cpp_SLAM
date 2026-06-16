@@ -24,7 +24,8 @@ public:
 
     // 다음 라이다 프레임을 읽습니다.
     // 반환 전까지 수신된 IMU 샘플은 getImuBuffer()로 꺼낼 수 있습니다.
-    bool nextFrame(std::vector<std::array<float, 3>>& points);
+    bool nextFrame(std::vector<std::array<float, 3>>& points,
+                   std::vector<float>* pointTimes = nullptr);
 
     // 직전 nextFrame() 호출 이후 쌓인 IMU 샘플 반환
     const std::vector<ImuSample>& getImuBuffer() const { return _imuBuffer; }
@@ -72,20 +73,24 @@ private:
 
     // PointCloud2 데이터에서 x, y, z 추출
     bool parsePointCloud2(const std::vector<uint8_t>& data,
-                          std::vector<std::array<float, 3>>& points);
+                          std::vector<std::array<float, 3>>& points,
+                          std::vector<float>* pointTimes = nullptr);
 
     // sensor_msgs/Imu 데이터 파싱
     bool parseImu(const std::vector<uint8_t>& data, ImuSample& sample);
 
     // livox_ros_driver/CustomMsg 데이터 파싱
     bool parseLivoxCustomMsg(const std::vector<uint8_t>& data,
-                             std::vector<std::array<float, 3>>& points);
+                             std::vector<std::array<float, 3>>& points,
+                             std::vector<float>* pointTimes = nullptr);
 
     // _lidarType에 따라 적절한 파서로 분기
     bool parseFrame(const std::vector<uint8_t>& data,
-                    std::vector<std::array<float, 3>>& points);
+                    std::vector<std::array<float, 3>>& points,
+                    std::vector<float>* pointTimes = nullptr);
 
     // CHUNK 버퍼(_chunkBuf/_chunkOffset)에서 프레임 하나를 꺼냄
     // 프레임 발견 → true, CHUNK 소진 → false
-    bool processChunkStep(std::vector<std::array<float, 3>>& points);
+    bool processChunkStep(std::vector<std::array<float, 3>>& points,
+                          std::vector<float>* pointTimes = nullptr);
 };

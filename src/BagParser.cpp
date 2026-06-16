@@ -276,7 +276,8 @@ bool BagParser::readRecordFromBuffer(const std::vector<uint8_t>& buf,
 // ── CHUNK 내부에서 다음 프레임을 꺼내는 내부 헬퍼 ────
 // _chunkBuf / _chunkOffset 상태를 이어받아 처리합니다.
 // 프레임을 하나 찾으면 true, CHUNK 끝이면 false를 반환해요.
-bool BagParser::processChunkStep(std::vector<std::array<float, 3>>& points)
+bool BagParser::processChunkStep(std::vector<std::array<float, 3>>& points,
+                                 std::vector<float>* pointTimes)
 {
     Record sub;
     while (readRecordFromBuffer(_chunkBuf, _chunkOffset, sub))
@@ -327,7 +328,7 @@ bool BagParser::processChunkStep(std::vector<std::array<float, 3>>& points)
 
             if (connId != _connId || _connId == -1) continue;
 
-            if (parseFrame(sub.data, points))
+            if (parseFrame(sub.data, points, pointTimes))
             {
                 ++_frameCount;
                 return true;
@@ -338,12 +339,15 @@ bool BagParser::processChunkStep(std::vector<std::array<float, 3>>& points)
 }
 
 // ── 다음 프레임 읽기 ─────────────────────────────────
-bool BagParser::nextFrame(std::vector<std::array<float, 3>>& points)
+bool BagParser::nextFrame(std::vector<std::array<float, 3>>& points,
+                          std::vector<float>* pointTimes)
 {
+    if (pointTimes) pointTimes->clear();
+
     // 1. 이전 호출에서 이어받은 CHUNK 버퍼가 있으면 먼저 소진해요
     if (!_chunkBuf.empty() && _chunkOffset < _chunkBuf.size())
     {
-        if (processChunkStep(points))
+        if (processChunkStep(points, pointTimes))
             return true;
         // CHUNK 다 읽었으면 버퍼 비우기
         _chunkBuf.clear();
@@ -394,7 +398,7 @@ bool BagParser::nextFrame(std::vector<std::array<float, 3>>& points)
             _chunkBuf    = std::move(rec.data);  // 복사 대신 이동
             _chunkOffset = 0;
 
-            if (processChunkStep(points))
+            if (processChunkStep(points, pointTimes))
                 return true;
 
             // 이 CHUNK에서 프레임을 못 찾은 경우 버퍼 비우기
@@ -419,7 +423,7 @@ bool BagParser::nextFrame(std::vector<std::array<float, 3>>& points)
 
             if (connId != _connId || _connId == -1) continue;
 
-            if (parseFrame(rec.data, points))
+            if (parseFrame(rec.data, points, pointTimes))
             {
                 ++_frameCount;
                 return true;
@@ -431,8 +435,11 @@ bool BagParser::nextFrame(std::vector<std::array<float, 3>>& points)
 
 // ── PointCloud2 역직렬화 ─────────────────────────────
 bool BagParser::parsePointCloud2(const std::vector<uint8_t>& data,
-                                   std::vector<std::array<float, 3>>& points)
+                                  std::vector<std::array<float, 3>>& points,
+                                  std::vector<float>* pointTimes)
 {
+    if (pointTimes) pointTimes->clear();
+
     size_t offset = 0;
 
     // ROS1 직렬화: 작은 단위부터 읽기
@@ -468,6 +475,8 @@ bool BagParser::parsePointCloud2(const std::vector<uint8_t>& data,
     // fields 배열
     uint32_t numFields = readU32();
     int xOffset = -1, yOffset = -1, zOffset = -1;
+    int timeOffset = -1;
+    uint8_t timeDtype = 0;
 
     for (uint32_t i = 0; i < numFields; ++i)
     {
@@ -475,11 +484,17 @@ bool BagParser::parsePointCloud2(const std::vector<uint8_t>& data,
         uint32_t    fOff   = readU32();
         uint8_t     dtype  = readU8();
         uint32_t    count  = readU32();
-        (void)dtype; (void)count;
+        (void)count;
 
         if (name == "x") xOffset = (int)fOff;
         else if (name == "y") yOffset = (int)fOff;
         else if (name == "z") zOffset = (int)fOff;
+        else if (timeOffset < 0 &&
+                 (name == "t" || name == "time" || name == "timestamp"))
+        {
+            timeOffset = (int)fOff;
+            timeDtype = dtype;
+        }
     }
 
     readU8();            // is_bigendian
@@ -493,9 +508,19 @@ bool BagParser::parsePointCloud2(const std::vector<uint8_t>& data,
         return false;
     }
 
+    static bool loggedFields = false;
+    if (!loggedFields)
+    {
+        loggedFields = true;
+        std::cout << "[BagParser] 시간 필드: "
+                   << (timeOffset >= 0 ? ("발견 (offset=" + std::to_string(timeOffset) + ", dtype=" + std::to_string(timeDtype) + ")") : "없음 — 디스큐잉 비활성")
+                   << std::endl;
+    }
+
     uint32_t numPoints = height * width;
     points.clear();
     points.reserve(numPoints);
+    if (pointTimes && timeOffset >= 0) pointTimes->reserve(numPoints);
 
     for (uint32_t i = 0; i < numPoints; ++i)
     {
@@ -511,6 +536,21 @@ bool BagParser::parsePointCloud2(const std::vector<uint8_t>& data,
         if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
 
         points.push_back({ x, y, z });
+        if (pointTimes && timeOffset >= 0)
+        {
+            float pointTime = 0.0f;
+            if (timeDtype == 6)
+            {
+                uint32_t rawNs = 0;
+                std::memcpy(&rawNs, &data[base + timeOffset], 4);
+                pointTime = (float)rawNs * 1e-9f;
+            }
+            else if (timeDtype == 7)
+            {
+                std::memcpy(&pointTime, &data[base + timeOffset], 4);
+            }
+            pointTimes->push_back(pointTime);
+        }
     }
 
     return !points.empty();
@@ -584,18 +624,19 @@ bool BagParser::parseImu(const std::vector<uint8_t>& data, ImuSample& sample)
 
 // ── parseFrame: 타입에 따라 파서 분기 ───────────────
 bool BagParser::parseFrame(const std::vector<uint8_t>& data,
-                            std::vector<std::array<float, 3>>& points)
+                           std::vector<std::array<float, 3>>& points,
+                           std::vector<float>* pointTimes)
 {
     switch (_lidarType)
     {
         case LidarType::PointCloud2:
-            return parsePointCloud2(data, points);
+            return parsePointCloud2(data, points, pointTimes);
         case LidarType::LivoxCustomMsg:
-            return parseLivoxCustomMsg(data, points);
+            return parseLivoxCustomMsg(data, points, pointTimes);
         default:
             // 타입 미감지 시 PointCloud2로 시도 후 CustomMsg로 재시도
-            if (parsePointCloud2(data, points)) return true;
-            return parseLivoxCustomMsg(data, points);
+            if (parsePointCloud2(data, points, pointTimes)) return true;
+            return parseLivoxCustomMsg(data, points, pointTimes);
     }
 }
 
@@ -610,8 +651,11 @@ bool BagParser::parseFrame(const std::vector<uint8_t>& data,
 //     └ offset_time u32, x f32, y f32, z f32,
 //       reflectivity u8, tag u8, line u8
 bool BagParser::parseLivoxCustomMsg(const std::vector<uint8_t>& data,
-                                     std::vector<std::array<float, 3>>& points)
+                                    std::vector<std::array<float, 3>>& points,
+                                    std::vector<float>* pointTimes)
 {
+    if (pointTimes) pointTimes->clear();
+
     size_t offset = 0;
 
     auto readU8 = [&]() -> uint8_t {
@@ -656,6 +700,7 @@ bool BagParser::parseLivoxCustomMsg(const std::vector<uint8_t>& data,
 
     points.clear();
     points.reserve(pointNum);
+    if (pointTimes) pointTimes->reserve(pointNum);
 
     // CustomPoint: offset_time(4) + x(4) + y(4) + z(4) + reflectivity(1) + tag(1) + line(1) = 19바이트
     constexpr size_t POINT_SIZE = 19;
@@ -664,7 +709,7 @@ bool BagParser::parseLivoxCustomMsg(const std::vector<uint8_t>& data,
     {
         if (offset + POINT_SIZE > data.size()) break;
 
-        readU32();              // offset_time (나노초, 사용 안 함)
+        uint32_t offsetTime = readU32();
         float x = readF32();
         float y = readF32();
         float z = readF32();
@@ -676,6 +721,8 @@ bool BagParser::parseLivoxCustomMsg(const std::vector<uint8_t>& data,
         if (x == 0.0f && y == 0.0f && z == 0.0f) continue;  // 무효 포인트
 
         points.push_back({x, y, z});
+        if (pointTimes)
+            pointTimes->push_back((float)offsetTime * 1e-9f);
     }
 
     return !points.empty();

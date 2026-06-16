@@ -1,43 +1,61 @@
-// Loop Closure 선언: 과거 프레임과 현재 프레임을 비교해 누적 오차를 보정합니다.
 #pragma once
 #include <array>
 #include <vector>
 #include "ICP.h"
+#include "PoseGraph.h"
 #include "VoxelGrid.h"
 
-// 과거 프레임 하나를 저장하는 구조체
 struct KeyFrame
 {
-    int                                  index;     // 프레임 번호
-    std::array<float, 3>                 position;  // 당시 추정 위치
-    std::vector<std::array<float, 3>>    points;    // 다운샘플링된 포인트
+    int                                  index;
+    std::array<float, 3>                 position;
+    Matrix3x3                            rotation;
+    std::vector<std::array<float, 3>>    points;
 };
 
 class LoopCloser
 {
 public:
-    // searchRadius : 루프 후보를 탐색할 반경 (meter)
-    // icpThreshold : 이 오차 이하면 루프로 판단
-    // minFrameGap  : 최근 N프레임은 루프 후보에서 제외 (바로 직전 프레임과 매칭 방지)
     LoopCloser(float searchRadius  = 1.0f,
                float icpThreshold  = 0.05f,
                int   minFrameGap   = 10);
 
-    // 새 키프레임 등록
     void addKeyFrame(int index,
-                     const std::array<float, 3>&              position,
+                     const std::array<float, 3>& position,
+                     const Matrix3x3& rotation,
                      const std::vector<std::array<float, 3>>& points);
 
-    // 루프 감지 시도
-    // 감지되면 true 반환, correctedTrajectory에 보정된 경로를 채워줌
-    bool detect(const std::array<float, 3>&              currentPos,
-                const std::vector<std::array<float, 3>>& currentPoints,
-                std::vector<std::array<float, 3>>&       trajectory);
+    bool detect(const std::array<float, 3>& currentPos,
+                const Matrix3x3& currentRot,
+                const std::vector<std::array<float, 3>>& currentPoints);
+
+    bool detect(int currentIndex,
+                const std::array<float, 3>& currentPos,
+                const Matrix3x3& currentRot,
+                const std::vector<std::array<float, 3>>& currentPoints);
+
+    void setTopNCandidates(int n) { _topNCandidates = n; }
+    void setLoopCooldown(int frames) { _loopCooldown = frames; }
+
+    int getLastLoopFromId() const { return _lastLoopFromId; }
+    int getLastLoopToId() const { return _lastLoopToId; }
+    Pose3D getLastLoopRelativePose() const { return _lastLoopRelativePose; }
 
 private:
     float _searchRadius;
     float _icpThreshold;
     int   _minFrameGap;
+    float _minFitness = 0.6f;  // 매칭된 점 비율이 이 이하면 우연히 비슷한 구조물로 간주
+    int   _topNCandidates = 5;
+    int   _loopCooldown   = 100;
 
     std::vector<KeyFrame> _keyFrames;
+    std::vector<int> _detectedFromIds;
+    int _lastLoopFrame = -9999;
+    int _lastLoopFromId = -1;
+    int _lastLoopToId = -1;
+    Pose3D _lastLoopRelativePose = {
+        {1,0,0, 0,1,0, 0,0,1},
+        {0,0,0}
+    };
 };

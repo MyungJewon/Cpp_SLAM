@@ -1,27 +1,34 @@
-// KD-Tree, ICP, Voxel Grid Filter, Odometry, Loop Closure, Map Builder, Bag Parser 테스트 진입점
-#include <iostream>
-#include <fstream>
+#include <algorithm>
 #include <array>
-#include <vector>
 #include <cmath>
-#include <limits>
-#include <chrono>
+#include <cstdint>
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <string>
 #include <thread>
-#include "PointCloud.h"
-#include "PlyParser.h"
-#include "KDTree.h"
-#include "ICP.h"
-#include "VoxelGrid.h"
-#include "Odometry.h"
+#include <vector>
+
+#include "BagParser.h"
+#include "ImuOdometry.h"
+#include "IMUPreintegrator.h"
 #include "LoopCloser.h"
 #include "MapBuilder.h"
-#include "BagParser.h"
-#include "IMUPreintegrator.h"
+#include "Odometry.h"
 #include "PangolinViewer.h"
+#include "PoseGraph.h"
 
-// ── 경로를 색상 그라디언트 PLY로 저장 (초록=시작, 빨강=끝) ──────────
+void printUsage()
+{
+    std::cout << "사용법 (토픽 확인): ./slam --info <bag파일>" << std::endl;
+    std::cout << "사용법 (SLAM):      ./slam <bag파일> <포인트토픽> <IMU토픽> [옵션]" << std::endl;
+    std::cout << "  예) ./slam data.bag /velodyne_points /imu" << std::endl;
+    std::cout << "  옵션: --no-lc    루프 클로저 비활성화" << std::endl;
+    std::cout << "        --no-imu  IMU 타이트 커플링 비활성화 (회전 디스큐잉만 사용)" << std::endl;
+}
+
 void saveTrajectoryPly(const std::vector<std::array<float, 3>>& traj,
-                        const std::string& path)
+                       const std::string& path)
 {
     std::ofstream f(path);
     f << "ply\nformat ascii 1.0\n"
@@ -43,47 +50,70 @@ void saveTrajectoryPly(const std::vector<std::array<float, 3>>& traj,
               << " (" << n << "개 점)" << std::endl;
 }
 
-// ── 2D 탑다운 이미지 저장 (PPM 포맷 — 라이브러리 없음) ──────────────
-// 맵 점은 청회색, 경로는 초록→빨강 그라디언트로 그려요.
-// macOS에서는 미리보기(Preview.app)로 바로 열 수 있어요.
+// 두 점 사이를 직선으로 그려서 buf에 색을 입힘 (DDA 알고리즘)
+void drawLine(std::vector<uint8_t>& buf, int imgSize,
+              int x0, int y0, int x1, int y1,
+              uint8_t r, uint8_t g, uint8_t b)
+{
+    int steps = std::max(std::abs(x1 - x0), std::abs(y1 - y0));
+    if (steps == 0)
+    {
+        int idx = (y0 * imgSize + x0) * 3;
+        buf[idx] = r; buf[idx + 1] = g; buf[idx + 2] = b;
+        return;
+    }
+    for (int i = 0; i <= steps; ++i)
+    {
+        float t = (float)i / steps;
+        int x = (int)(x0 + (x1 - x0) * t);
+        int y = (int)(y0 + (y1 - y0) * t);
+        if (x < 0 || x >= imgSize || y < 0 || y >= imgSize) continue;
+        int idx = (y * imgSize + x) * 3;
+        buf[idx] = r; buf[idx + 1] = g; buf[idx + 2] = b;
+    }
+}
+
 void saveMapImage(const std::vector<std::array<float, 3>>& traj,
                   const std::vector<std::array<float, 3>>& mapPts,
-                  const std::string& path, int imgSize = 1024)
+                  const std::string& path,
+                  const std::vector<std::pair<int, int>>& loopEdges = {},
+                  int imgSize = 1024)
 {
     if (traj.empty()) return;
 
-    // 바운딩 박스 (경로 + 맵 점 모두 포함)
     float minX = traj[0][0], maxX = traj[0][0];
     float minY = traj[0][1], maxY = traj[0][1];
-    for (const auto& p : traj)   { minX=std::min(minX,p[0]); maxX=std::max(maxX,p[0]);
-                                    minY=std::min(minY,p[1]); maxY=std::max(maxY,p[1]); }
-    for (const auto& p : mapPts) { minX=std::min(minX,p[0]); maxX=std::max(maxX,p[0]);
-                                    minY=std::min(minY,p[1]); maxY=std::max(maxY,p[1]); }
+    for (const auto& p : traj)
+    {
+        minX = std::min(minX, p[0]); maxX = std::max(maxX, p[0]);
+        minY = std::min(minY, p[1]); maxY = std::max(maxY, p[1]);
+    }
+    for (const auto& p : mapPts)
+    {
+        minX = std::min(minX, p[0]); maxX = std::max(maxX, p[0]);
+        minY = std::min(minY, p[1]); maxY = std::max(maxY, p[1]);
+    }
 
     float range = std::max(maxX - minX, maxY - minY) * 1.1f + 0.1f;
     float cx = (minX + maxX) / 2.0f;
     float cy = (minY + maxY) / 2.0f;
 
-    // 좌표 → 픽셀 (y축 반전: 화면 위 = 월드 위)
-    auto toPixel = [&](float x, float y) -> std::pair<int,int> {
+    auto toPixel = [&](float x, float y) -> std::pair<int, int> {
         int px = (int)((x - cx) / range * imgSize + imgSize * 0.5f);
         int py = (int)(-(y - cy) / range * imgSize + imgSize * 0.5f);
-        return { std::max(0, std::min(imgSize-1, px)),
-                 std::max(0, std::min(imgSize-1, py)) };
+        return {std::max(0, std::min(imgSize - 1, px)),
+                std::max(0, std::min(imgSize - 1, py))};
     };
 
-    // 배경: 어두운 회색
     std::vector<uint8_t> buf(imgSize * imgSize * 3, 25);
 
-    // 맵 점: 청회색
     for (const auto& p : mapPts)
     {
         auto [x, y] = toPixel(p[0], p[1]);
         int idx = (y * imgSize + x) * 3;
-        buf[idx] = 60; buf[idx+1] = 70; buf[idx+2] = 80;
+        buf[idx] = 60; buf[idx + 1] = 70; buf[idx + 2] = 80;
     }
 
-    // 경로: 초록(시작) → 빨강(끝), 3×3 점으로 굵게
     int n = (int)traj.size();
     for (int i = 0; i < n; ++i)
     {
@@ -94,14 +124,24 @@ void saveMapImage(const std::vector<std::array<float, 3>>& traj,
         for (int dy = -1; dy <= 1; ++dy)
         for (int dx = -1; dx <= 1; ++dx)
         {
-            int nx = std::max(0, std::min(imgSize-1, x+dx));
-            int ny = std::max(0, std::min(imgSize-1, y+dy));
+            int nx = std::max(0, std::min(imgSize - 1, x + dx));
+            int ny = std::max(0, std::min(imgSize - 1, y + dy));
             int idx = (ny * imgSize + nx) * 3;
-            buf[idx] = r; buf[idx+1] = g; buf[idx+2] = 50;
+            buf[idx] = r; buf[idx + 1] = g; buf[idx + 2] = 50;
         }
     }
 
-    // PPM P6 (바이너리) 저장
+    // 루프 클로저로 연결된 두 지점을 마젠타 선으로 표시 — 어떤 두 위치가
+    // 잘못 매칭됐는지 한눈에 확인할 수 있음
+    for (const auto& edge : loopEdges)
+    {
+        int fromId = edge.first, toId = edge.second;
+        if (fromId < 0 || toId < 0 || fromId >= n || toId >= n) continue;
+        auto [x0, y0] = toPixel(traj[fromId][0], traj[fromId][1]);
+        auto [x1, y1] = toPixel(traj[toId][0], traj[toId][1]);
+        drawLine(buf, imgSize, x0, y0, x1, y1, 255, 0, 255);
+    }
+
     std::ofstream f(path, std::ios::binary);
     f << "P6\n" << imgSize << " " << imgSize << "\n255\n";
     f.write(reinterpret_cast<const char*>(buf.data()), (std::streamsize)buf.size());
@@ -110,69 +150,78 @@ void saveMapImage(const std::vector<std::array<float, 3>>& traj,
     std::cout << "             → macOS Finder에서 더블클릭하면 미리보기로 열려요" << std::endl;
 }
 
-// 포인트 클라우드에서 KD-Tree에 넣을 형태로 변환
-std::vector<std::array<float, 3>> extractPoints(const PointCloud& cloud)
+Matrix3x3 transposeMat(const Matrix3x3& R)
 {
-    std::vector<std::array<float, 3>> points;
-    points.reserve(cloud.vertexCount);
-
-    for (int i = 0; i < cloud.vertexCount; ++i)
-    {
-        const float* pos = reinterpret_cast<const float*>(&cloud.rawData[i * cloud.stride]);
-        points.push_back({ pos[0], pos[1], pos[2] });
-    }
-    return points;
+    return {
+        R[0], R[3], R[6],
+        R[1], R[4], R[7],
+        R[2], R[5], R[8]
+    };
 }
 
-// 브루트 포스: 전체를 다 뒤져서 가장 가까운 점 반환
-std::array<float, 3> bruteForceNearest(const std::vector<std::array<float, 3>>& points,
-                                        const std::array<float, 3>& query)
+Matrix3x3 multiplyMat3(const Matrix3x3& A, const Matrix3x3& B)
 {
-    float bestDist = std::numeric_limits<float>::max();
-    std::array<float, 3> best = {};
+    Matrix3x3 C = {};
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            for (int k = 0; k < 3; ++k)
+                C[i*3+j] += A[i*3+k] * B[k*3+j];
+    return C;
+}
 
-    for (const auto& p : points)
-    {
-        float dist = 0.0f;
-        for (int i = 0; i < 3; ++i)
-            dist += (p[i] - query[i]) * (p[i] - query[i]);
+std::array<float, 3> multiplyVec3(const Matrix3x3& R, const std::array<float, 3>& v)
+{
+    return {
+        R[0]*v[0] + R[1]*v[1] + R[2]*v[2],
+        R[3]*v[0] + R[4]*v[1] + R[5]*v[2],
+        R[6]*v[0] + R[7]*v[1] + R[8]*v[2]
+    };
+}
 
-        if (dist < bestDist)
-        {
-            bestDist = dist;
-            best = p;
-        }
-    }
-    return best;
+Pose3D makePose(const Matrix3x3& R, const std::array<float, 3>& t)
+{
+    return {R, t};
+}
+
+Pose3D relativePose(const Pose3D& from, const Pose3D& to)
+{
+    Matrix3x3 invR = transposeMat(from.R);
+    Matrix3x3 dR = multiplyMat3(invR, to.R);
+    std::array<float, 3> dt = {
+        to.t[0] - from.t[0],
+        to.t[1] - from.t[1],
+        to.t[2] - from.t[2]
+    };
+    return {dR, multiplyVec3(invR, dt)};
+}
+
+std::vector<std::array<float, 3>> poseTrajectory(const std::vector<Pose3D>& poses)
+{
+    std::vector<std::array<float, 3>> traj;
+    traj.reserve(poses.size());
+    for (const auto& pose : poses)
+        traj.push_back(pose.t);
+    return traj;
 }
 
 int main(int argc, char* argv[])
 {
-    // ── 인자 파싱 ────────────────────────────────────────
-    // 모드 1: PLY 테스트     ./slam <ply파일>
-    // 모드 2: SLAM 실행      ./slam <bag파일> <포인트클라우드토픽> <IMU토픽>
-    //                        예) ./slam data.bag /velodyne_points /imu
     if (argc < 2)
     {
-        std::cout << "사용법 (토픽 확인): ./slam --info <bag파일>" << std::endl;
-        std::cout << "사용법 (테스트):    ./slam <ply파일>" << std::endl;
-        std::cout << "사용법 (SLAM):      ./slam <bag파일> <포인트토픽> <IMU토픽>" << std::endl;
-        std::cout << "  예) ./slam data.bag /velodyne_points /imu" << std::endl;
+        printUsage();
         return -1;
     }
 
-    // 실행 파일 위치 기준으로 output 폴더 경로 결정
-    // argv[0] = ".../build/slam" → 부모 폴더의 output/
     std::string exePath(argv[0]);
-    std::string exeDir = exePath.substr(0, exePath.find_last_of("/\\"));
+    size_t slashPos = exePath.find_last_of("/\\");
+    std::string exeDir = (slashPos == std::string::npos) ? "." : exePath.substr(0, slashPos);
     std::string outputDir = exeDir + "/../output/";
 
-    // --info 모드: bag 안의 토픽 목록 출력 후 종료
     if (std::string(argv[1]) == "--info")
     {
         if (argc < 3)
         {
-            std::cout << "사용법: ./slam --info <bag파일>" << std::endl;
+            printUsage();
             return -1;
         }
         BagParser info(argv[2], "", "");
@@ -180,229 +229,68 @@ int main(int argc, char* argv[])
         return 0;
     }
 
-    std::string firstArg = argv[1];
-    bool isSlamMode = (argc >= 4);  // bag + 포인트토픽 + IMU토픽
-
-    std::string bagPath      = isSlamMode ? argv[1] : "";
-    std::string pointsTopic  = isSlamMode ? argv[2] : "";
-    std::string imuTopic     = isSlamMode ? argv[3] : "";
-
-    if (isSlamMode)
+    bool useLoopClosure = true;
+    bool useImuOdom = true;
+    std::vector<std::string> posArgs;
+    for (int i = 1; i < argc; ++i)
     {
-        std::cout << "[SLAM 모드]" << std::endl;
-        std::cout << "  bag 파일       : " << bagPath << std::endl;
-        std::cout << "  포인트 토픽    : " << pointsTopic << std::endl;
-        std::cout << "  IMU 토픽       : " << imuTopic << std::endl;
+        std::string a(argv[i]);
+        if (a == "--no-lc" || a == "-nlc")
+            useLoopClosure = false;
+        else if (a == "--no-imu" || a == "-nimu")
+            useImuOdom = false;
+        else
+            posArgs.push_back(a);
     }
 
-    // PLY 테스트 모드에서만 사용
-    PointCloud cloud;
-    if (!isSlamMode)
+    if (posArgs.size() < 3)
     {
-        if (!loadPly(argv[1], cloud))
-        {
-            std::cout << "PLY 로드 실패" << std::endl;
-            return -1;
-        }
-        std::cout << "로드 완료: " << cloud.vertexCount << "개 점" << std::endl;
+        printUsage();
+        return -1;
     }
 
-    if (!isSlamMode)
-    {
-        // 포인트 추출
-        auto points = extractPoints(cloud);
+    std::string bagPath = posArgs[0];
+    std::string pointsTopic = posArgs[1];
+    std::string imuTopic = posArgs[2];
 
-        // KD-Tree 구축 시간 측정
-        auto t0 = std::chrono::high_resolution_clock::now();
-        KDTree tree;
-        tree.build(points);
-        auto t1 = std::chrono::high_resolution_clock::now();
-        std::cout << "KD-Tree 구축: "
-                  << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()
-                  << "ms" << std::endl;
-
-        std::array<float, 3> query = { points[0][0] + 0.1f,
-                                       points[0][1] + 0.1f,
-                                       points[0][2] + 0.1f };
-
-        auto t2 = std::chrono::high_resolution_clock::now();
-        auto kdResult = tree.nearest(query);
-        auto t3 = std::chrono::high_resolution_clock::now();
-
-        auto t4 = std::chrono::high_resolution_clock::now();
-        auto bfResult = bruteForceNearest(points, query);
-        auto t5 = std::chrono::high_resolution_clock::now();
-
-        std::cout << "\n--- 결과 비교 ---" << std::endl;
-        std::cout << "쿼리 점      : ("  << query[0]    << ", " << query[1]    << ", " << query[2]    << ")" << std::endl;
-        std::cout << "KD-Tree 결과 : ("  << kdResult[0] << ", " << kdResult[1] << ", " << kdResult[2] << ")" << std::endl;
-        std::cout << "브루트포스   : ("  << bfResult[0] << ", " << bfResult[1] << ", " << bfResult[2] << ")" << std::endl;
-        std::cout << "결과 일치    : "   << (kdResult == bfResult ? "✅ 일치" : "❌ 불일치") << std::endl;
-
-        std::cout << "\n--- 속도 비교 ---" << std::endl;
-        std::cout << "KD-Tree  : "
-                  << std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count()
-                  << "μs" << std::endl;
-        std::cout << "브루트포스: "
-                  << std::chrono::duration_cast<std::chrono::microseconds>(t5 - t4).count()
-                  << "μs" << std::endl;
-
-        // 다운샘플링
-        float voxelSize = 0.3f;
-        auto dsStart = std::chrono::high_resolution_clock::now();
-        auto dst_ds = voxelGridFilter(points, voxelSize);
-        auto dsEnd   = std::chrono::high_resolution_clock::now();
-
-        std::cout << "\n--- 다운샘플링 결과 ---" << std::endl;
-        std::cout << "원본 점 개수     : " << points.size() << std::endl;
-        std::cout << "다운샘플링 후    : " << dst_ds.size() << std::endl;
-        std::cout << "축소 비율        : "
-                  << (1.0f - (float)dst_ds.size() / points.size()) * 100.0f
-                  << "%" << std::endl;
-        std::cout << "다운샘플링 시간  : "
-                  << std::chrono::duration_cast<std::chrono::milliseconds>(dsEnd - dsStart).count()
-                  << "ms" << std::endl;
-
-        // ICP 테스트
-        std::array<float, 3> trueT = { 0.05f, 0.03f, 0.02f };
-        float angle = 1.0f * M_PI / 180.0f;
-        Matrix3x3 trueR = {
-             std::cos(angle), -std::sin(angle), 0,
-             std::sin(angle),  std::cos(angle), 0,
-             0,                0,               1
-        };
-
-        std::vector<std::array<float, 3>> src_ds;
-        src_ds.reserve(dst_ds.size());
-        for (const auto& p : dst_ds)
-        {
-            std::array<float, 3> rotated = {
-                trueR[0]*p[0] + trueR[1]*p[1] + trueR[2]*p[2],
-                trueR[3]*p[0] + trueR[4]*p[1] + trueR[5]*p[2],
-                trueR[6]*p[0] + trueR[7]*p[1] + trueR[8]*p[2]
-            };
-            src_ds.push_back({ rotated[0] + trueT[0],
-                               rotated[1] + trueT[1],
-                               rotated[2] + trueT[2] });
-        }
-
-        std::cout << "\n--- ICP 테스트 ---" << std::endl;
-        std::cout << "실제 이동값 : ("
-                  << trueT[0] << ", " << trueT[1] << ", " << trueT[2] << ")" << std::endl;
-        std::cout << "실제 회전각 : 1도 (Z축)" << std::endl;
-
-        auto icpStart = std::chrono::high_resolution_clock::now();
-        ICPResult icp = runICP(src_ds, dst_ds);
-        auto icpEnd   = std::chrono::high_resolution_clock::now();
-
-        std::cout << "\n--- ICP 결과 ---" << std::endl;
-        std::cout << "반복 횟수 : " << icp.iterations << std::endl;
-        std::cout << "최종 오차 : " << icp.error << std::endl;
-        std::cout << "추정 이동값: ("
-                  << -icp.t[0] << ", " << -icp.t[1] << ", " << -icp.t[2] << ")" << std::endl;
-        std::cout << "ICP 소요시간: "
-                  << std::chrono::duration_cast<std::chrono::milliseconds>(icpEnd - icpStart).count()
-                  << "ms" << std::endl;
-
-        // Odometry 테스트
-        std::cout << "\n--- Odometry 테스트 ---" << std::endl;
-        Odometry odom(0.3f);
-        odom.addFrame(points);
-        for (int frame = 1; frame <= 4; ++frame)
-        {
-            std::vector<std::array<float, 3>> shifted;
-            shifted.reserve(points.size());
-            for (const auto& p : points)
-                shifted.push_back({ p[0] + 0.05f * frame, p[1], p[2] });
-            odom.addFrame(shifted);
-        }
-        auto finalPos = odom.getPosition();
-        std::cout << "예상 최종 위치 : (0.2, 0, 0)" << std::endl;
-        std::cout << "추정 최종 위치 : ("
-                  << finalPos[0] << ", " << finalPos[1] << ", " << finalPos[2] << ")" << std::endl;
-
-        const auto& traj = odom.getTrajectory();
-        for (int i = 0; i < (int)traj.size(); ++i)
-            std::cout << "  프레임 " << i << " : ("
-                      << traj[i][0] << ", " << traj[i][1] << ", " << traj[i][2] << ")" << std::endl;
-
-        // Loop Closure 테스트
-        std::cout << "\n--- Loop Closure 테스트 ---" << std::endl;
-        Odometry   odom2(0.3f);
-        LoopCloser loopCloser(0.08f, 0.05f, 3);
-
-        for (int frame = 0; frame <= 4; ++frame)
-        {
-            std::vector<std::array<float, 3>> shifted;
-            shifted.reserve(points.size());
-            for (const auto& p : points)
-                shifted.push_back({ p[0] + 0.05f * frame, p[1], p[2] });
-            odom2.addFrame(shifted);
-            auto pos    = odom2.getPosition();
-            auto ds_pts = voxelGridFilter(shifted, 0.3f);
-            loopCloser.addKeyFrame(frame, pos, ds_pts);
-        }
-        for (int frame = 5; frame <= 8; ++frame)
-        {
-            std::vector<std::array<float, 3>> shifted;
-            shifted.reserve(points.size());
-            for (const auto& p : points)
-                shifted.push_back({ p[0] + 0.05f * (8 - frame), p[1], p[2] });
-            odom2.addFrame(shifted);
-            auto pos       = odom2.getPosition();
-            auto ds_pts    = voxelGridFilter(shifted, 0.3f);
-            auto corrected = odom2.getTrajectory();
-            if (loopCloser.detect(pos, ds_pts, corrected))
-            {
-                std::cout << "보정 전: (" << pos[0] << ", " << pos[1] << ", " << pos[2] << ")" << std::endl;
-                std::cout << "보정 후: (" << corrected.back()[0] << ", "
-                          << corrected.back()[1] << ", " << corrected.back()[2] << ")" << std::endl;
-                break;
-            }
-            loopCloser.addKeyFrame(frame, pos, ds_pts);
-        }
-
-        // Map Builder 테스트
-        std::cout << "\n--- Map Builder 테스트 ---" << std::endl;
-        Odometry   odom3(0.3f);
-        MapBuilder mapBuilder(0.3f, 5);
-        for (int frame = 0; frame <= 4; ++frame)
-        {
-            std::vector<std::array<float, 3>> shifted;
-            shifted.reserve(points.size());
-            for (const auto& p : points)
-                shifted.push_back({ p[0] + 0.05f * frame, p[1], p[2] });
-            odom3.addFrame(shifted);
-            auto ds_pts = voxelGridFilter(shifted, 0.3f);
-            mapBuilder.addFrame(ds_pts, odom3.getRotation(), odom3.getPosition());
-            std::cout << "[MapBuilder] 프레임 " << frame
-                      << " | 맵 점 개수: " << mapBuilder.getPointCount() << std::endl;
-        }
-        mapBuilder.saveToPly(outputDir + "output_map.ply");
-
-        return 0;
-    }
-
-    // ── SLAM 파이프라인 (bag 모드) ───────────────────────
+    std::cout << "[SLAM 모드]" << std::endl;
+    std::cout << "  bag 파일       : " << bagPath << std::endl;
+    std::cout << "  포인트 토픽    : " << pointsTopic << std::endl;
+    std::cout << "  IMU 토픽       : " << imuTopic << std::endl;
+    std::cout << "  루프 클로저    : " << (useLoopClosure ? "ON" : "OFF (--no-lc)") << std::endl;
+    std::cout << "  IMU 타이트커플링: " << (useImuOdom ? "ON" : "OFF (--no-imu, 회전 디스큐잉만 사용)") << std::endl;
     std::cout << "\n--- Bag Parser + SLAM ---" << std::endl;
 
     BagParser        bag(bagPath, pointsTopic, imuTopic);
     Odometry         bagOdom(0.3f);
     MapBuilder       bagMap(0.3f, 10);
+    PoseGraph        poseGraph;
     IMUPreintegrator imu;
+    imu.calibrate();
+    std::unique_ptr<ImuOdometry> imuOdom;
+    bool firstFrameDone = false;
 
-    bagOdom.setGroundMode(true);
+    bagOdom.setGroundMode(false);
     bagOdom.setImuPreintegrator(&imu);
-    bagOdom.setLocalMapMaxPts(5000);   // ICP 대상 최대 점 수 — 많을수록 정확하지만 느림 (권장: 3000~8000)
+    bagOdom.setLocalMapMaxPts(5000);
+    bagOdom.setStationaryThresh(0.03f, 0.5f);
     PangolinViewer viewer;
 
-    LoopCloser bagLoopCloser(10.0f, 0.5f, 50);
-    int keyFrameId = 0;
-    int loopCount  = 0;
+    LoopCloser bagLoopCloser(5.0f, 0.2f, 50);
+    bagLoopCloser.setLoopCooldown(100);
+    bool poseGraphInited = false;
+    Pose3D prevPose = {
+        {1,0,0, 0,1,0, 0,0,1},
+        {0,0,0}
+    };
+    int loopCount = 0;
     int slamExitCode = 0;
+    std::vector<std::pair<int, int>> loopEdges;
 
     std::vector<std::array<float, 3>> framePoints;
+    std::vector<float> pointTimes;
     int frameIdx = 0;
+    bool imuCalibrationLogged = false;
 
     std::thread slamThread([&]() {
         if (!bag.open())
@@ -413,41 +301,101 @@ int main(int argc, char* argv[])
             return;
         }
 
-        while (bag.nextFrame(framePoints) && !viewer.shouldQuit())
+        while (bag.nextFrame(framePoints, &pointTimes) && !viewer.shouldQuit())
         {
-            // 이번 라이다 프레임 이전까지 쌓인 IMU 샘플을 적분
-            for (const auto& s : bag.getImuBuffer())
+            const auto& imuSamples = bag.getImuBuffer();
+            for (const auto& s : imuSamples)
                 imu.addSample(s);
+
+            if (!imuCalibrationLogged && imu.isCalibrated())
+            {
+                auto bias = imu.getGyroBias();
+                std::cout << "[IMU] 캘리브레이션 완료 (자이로 바이어스: "
+                          << bias[0] << ", " << bias[1] << ", " << bias[2]
+                          << ")" << std::endl;
+                imuCalibrationLogged = true;
+            }
+
+            if (useImuOdom && !imuOdom && imu.isCalibrated() && firstFrameDone)
+            {
+                imuOdom = std::make_unique<ImuOdometry>(imu.getGyroBias(), 9.81);
+                imuOdom->init(bagOdom.getRotation(), bagOdom.getPosition());
+                bagOdom.setImuOdometry(imuOdom.get());
+            }
+
+            if (imuOdom)
+                imuOdom->integrateImu(imuSamples);
+
             bag.clearImuBuffer();
+            bagOdom.addFrame(framePoints, &pointTimes);
+            if (!firstFrameDone)
+                firstFrameDone = true;
+            Pose3D currentPose = makePose(bagOdom.getRotation(), bagOdom.getPosition());
 
-            bagOdom.addFrame(framePoints);
-            auto pos = bagOdom.getPosition();
+            if (!poseGraphInited)
+            {
+                poseGraph.init(currentPose);
+                poseGraphInited = true;
+            }
+            else
+            {
+                Pose3D delta = relativePose(prevPose, currentPose);
+                poseGraph.addOdometry(delta);
+            }
+            prevPose = currentPose;
 
-            // Odometry 내부에서 이미 다운샘플링한 프레임을 재활용 — 중복 VoxelGrid 제거
+            auto pos = currentPose.t;
+
             const auto& ds = bagOdom.getLastFrame();
             bagMap.addFrame(ds, bagOdom.getRotation(), pos);
-            viewer.update(bagMap.getMap(), bagOdom.getTrajectory(), bagOdom.getRotation(), pos, frameIdx, 0.0f);
 
-            if (frameIdx % 5 == 0)
+            if (frameIdx % 20 == 0)
             {
-                auto corrected = bagOdom.getTrajectory();
-                if (bagLoopCloser.detect(pos, ds, corrected))
+                const int keyFrameId = poseGraph.getCurrentId();
+                bagMap.storeKeyFramePoints(keyFrameId, ds, currentPose);
+                float moveDist = 0.0f;
+                if (!bagOdom.getTrajectory().empty())
                 {
-                    bagOdom.setTrajectory(corrected);
-                    bagOdom.setPosition(corrected.back());
+                    const auto& traj = bagOdom.getTrajectory();
+                    int n = (int)traj.size();
+                    int lookback = std::min(n - 1, 10);
+                    if (lookback > 0)
+                    {
+                        float dx = traj[n-1][0] - traj[n-1-lookback][0];
+                        float dy = traj[n-1][1] - traj[n-1-lookback][1];
+                        moveDist = std::sqrt(dx*dx + dy*dy);
+                    }
+                }
+
+                if (useLoopClosure && moveDist > 0.05f && bagLoopCloser.detect(keyFrameId, pos, currentPose.R, ds))
+                {
+                    loopEdges.push_back({bagLoopCloser.getLastLoopFromId(), bagLoopCloser.getLastLoopToId()});
+                    // 맵 재구성은 여기서 하지 않음 — 중간 추정치로 전체를 다시 그리면
+                    // 작은 보정 오차가 먼 거리 점에 크게 증폭됨. 트래젝토리만 갱신하고
+                    // 맵 재구성은 모든 프레임 처리가 끝난 뒤 한 번만 수행한다.
+                    const auto optimizedPoses = poseGraph.addLoopClosure(
+                        bagLoopCloser.getLastLoopFromId(),
+                        bagLoopCloser.getLastLoopToId(),
+                        bagLoopCloser.getLastLoopRelativePose());
+                    const auto optimizedTrajectory = poseTrajectory(optimizedPoses);
+                    bagOdom.setTrajectory(optimizedTrajectory);
+                    if (!optimizedPoses.empty())
+                        bagOdom.setPosition(optimizedPoses.back().t);
                     ++loopCount;
                     std::cout << "[SLAM] 루프 클로저 보정! (누적 " << loopCount << "회)" << std::endl;
                 }
                 else
                 {
-                    bagLoopCloser.addKeyFrame(keyFrameId++, pos, ds);
+                    bagLoopCloser.addKeyFrame(keyFrameId, pos, currentPose.R, ds);
                 }
             }
 
+            viewer.update(bagMap.getMap(), bagOdom.getTrajectory(), bagOdom.getRotation(), bagOdom.getPosition(), frameIdx, 0.0f);
+
             std::cout << "[SLAM] 프레임 " << frameIdx
-                      << " | 점 개수: "   << framePoints.size()
-                      << " | 위치: ("     << pos[0] << ", " << pos[1] << ", " << pos[2] << ")"
-                      << " | 맵 크기: "   << bagMap.getPointCount()
+                      << " | 점 개수: " << framePoints.size()
+                      << " | 위치: (" << pos[0] << ", " << pos[1] << ", " << pos[2] << ")"
+                      << " | 맵 크기: " << bagMap.getPointCount()
                       << std::endl;
 
             ++frameIdx;
@@ -455,9 +403,17 @@ int main(int argc, char* argv[])
 
         bag.close();
 
+        // 모든 프레임 처리 후 GTSAM이 충분히 수렴한 최종 포즈로 맵을 한 번만 재구성
+        if (loopCount > 0)
+        {
+            const auto finalPoses = poseGraph.getAllPoses();
+            bagMap.rebuildFromPoses(finalPoses);
+            bagOdom.setTrajectory(poseTrajectory(finalPoses));
+        }
+
         bagMap.saveToPly(outputDir + "slam_map.ply");
         saveTrajectoryPly(bagOdom.getTrajectory(), outputDir + "slam_trajectory.ply");
-        saveMapImage(bagOdom.getTrajectory(), bagMap.getMap(), outputDir + "slam_map_2d.ppm");
+        saveMapImage(bagOdom.getTrajectory(), bagMap.getMap(), outputDir + "slam_map_2d.ppm", loopEdges);
 
         std::cout << "\n--- SLAM 결과 ---" << std::endl;
         std::cout << "처리 프레임 수  : " << frameIdx << std::endl;

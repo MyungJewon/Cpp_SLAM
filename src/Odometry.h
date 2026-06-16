@@ -4,7 +4,9 @@
 #include <vector>
 #include "ICP.h"
 #include "VoxelGrid.h"
+#include "VoxelMap.h"
 #include "IMUPreintegrator.h"
+#include "ImuOdometry.h"
 
 class Odometry
 {
@@ -13,7 +15,8 @@ public:
 
     // 새 프레임을 입력받아 이전 프레임과 ICP 실행 후 누적 위치 갱신
     // 첫 프레임은 기준으로 저장만 하고 위치는 갱신하지 않음
-    void addFrame(const std::vector<std::array<float, 3>>& rawPoints);
+    void addFrame(const std::vector<std::array<float, 3>>& rawPoints,
+                  const std::vector<float>* pointTimes = nullptr);
 
     // 현재 누적 위치 반환 (x, y, z)
     std::array<float, 3> getPosition() const;
@@ -40,9 +43,19 @@ public:
     // ICP 대상 로컬 맵 최대 점 개수 (기본 5000) — 클수록 정확하지만 느림
     void setLocalMapMaxPts(int n) { _localMapMaxPts = n; }
 
+    // 정지 감지 임계값 설정
+    // stepM  : 이동량(m) 이하면 정지로 판단 (기본 0.03m)
+    // angleDeg: 회전량(도) 이하면 정지로 판단 (기본 0.5도)
+    void setStationaryThresh(float stepM, float angleDeg)
+    {
+        _stationaryStepM   = stepM;
+        _stationaryAngleDeg = angleDeg;
+    }
+
     // IMU 프리인테그레이터 연결 (nullptr이면 IMU 미사용)
     // addFrame() 내부에서 ICP 초기값으로 활용하고 자동으로 reset() 호출
     void setImuPreintegrator(IMUPreintegrator* imu) { _imu = imu; }
+    void setImuOdometry(ImuOdometry* imuOdom) { _imuOdom = imuOdom; }
 
 private:
     float     _voxelSize;
@@ -50,12 +63,15 @@ private:
     bool      _groundMode    = false;
     float     _maxStepDist   = 2.0f;   // 프레임당 최대 이동 거리 (m) — 초과 시 ICP 실패로 간주
     IMUPreintegrator* _imu   = nullptr;
+    ImuOdometry* _imuOdom    = nullptr;
 
     Matrix3x3                            _rotation;    // 누적 회전
     std::array<float, 3>                 _position;    // 누적 위치
     std::vector<std::array<float, 3>>    _trajectory;  // 경로 기록
     std::vector<std::array<float, 3>>    _lastFrame;   // 마지막 다운샘플링 프레임
-    std::vector<std::array<float, 3>>    _localMap;          // 월드 좌표계 로컬 맵
-    int                                  _localMapFrameCount = 0;
+    VoxelMap                             _localMap;          // 월드 좌표계 로컬 맵
     int                                  _localMapMaxPts     = 5000; // KD-Tree 대상 상한
+
+    float _stationaryStepM    = 0.03f;  // 정지 판단 이동 임계값 (m)
+    float _stationaryAngleDeg = 0.5f;   // 정지 판단 회전 임계값 (도)
 };

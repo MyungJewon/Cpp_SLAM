@@ -4,11 +4,16 @@ project(CppSLAM CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+find_package(GTSAM REQUIRED)
+
 add_executable(slam
     src/main.cpp
     src/PlyParser.cpp
     src/KDTree.cpp
     src/ICP.cpp
+    src/PoseGraph.cpp
+    src/ImuOdometry.cpp
+    src/ScanContext.cpp
     src/VoxelGrid.cpp
     src/Odometry.cpp
     src/LoopCloser.cpp
@@ -30,8 +35,10 @@ target_sources(slam PRIVATE src/PangolinViewer.cpp)
 target_include_directories(slam PRIVATE
     ${Pangolin_INCLUDE_DIRS}
     ${GLEW_INCLUDE}
+    /usr/local/include
 )
 target_link_libraries(slam
+    gtsam
     ${Pangolin_LIBRARIES}
     ${GLEW_LIB}
 )

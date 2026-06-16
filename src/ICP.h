@@ -17,6 +17,7 @@ struct ICPResult
     std::array<float, 3> t;          // 이동벡터
     int                  iterations; // 실제 반복 횟수
     float                error;      // 최종 오차
+    float                fitness;    // 매칭된 점 비율 (0~1) — src 점 중 maxDistSq 이내로 대응된 비율
 };
 
 // src를 dst에 맞추는 ICP 실행

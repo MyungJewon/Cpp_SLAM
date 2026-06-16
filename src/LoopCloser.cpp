@@ -1,5 +1,5 @@
-// Loop Closure 구현: 과거 프레임과 현재 프레임을 비교해 누적 오차를 보정합니다.
 #include "LoopCloser.h"
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 
@@ -11,98 +11,127 @@ LoopCloser::LoopCloser(float searchRadius, float icpThreshold, int minFrameGap)
 }
 
 void LoopCloser::addKeyFrame(int index,
-                              const std::array<float, 3>&              position,
+                              const std::array<float, 3>& position,
+                              const Matrix3x3& rotation,
                               const std::vector<std::array<float, 3>>& points)
 {
     KeyFrame kf;
     kf.index    = index;
     kf.position = position;
+    kf.rotation = rotation;
     kf.points   = points;
     _keyFrames.push_back(kf);
 }
 
-bool LoopCloser::detect(const std::array<float, 3>&              currentPos,
-                         const std::vector<std::array<float, 3>>& currentPoints,
-                         std::vector<std::array<float, 3>>&       trajectory)
+bool LoopCloser::detect(const std::array<float, 3>& currentPos,
+                         const Matrix3x3& currentRot,
+                         const std::vector<std::array<float, 3>>& currentPoints)
 {
-    int currentIndex = (int)_keyFrames.size();
+    return detect((int)_keyFrames.size(), currentPos, currentRot, currentPoints);
+}
 
-    // 1. 반경 안의 과거 프레임을 후보로 추림
-    std::vector<const KeyFrame*> candidates;
+bool LoopCloser::detect(int currentIndex,
+                         const std::array<float, 3>& currentPos,
+                         const Matrix3x3& currentRot,
+                         const std::vector<std::array<float, 3>>& currentPoints)
+{
+    _lastLoopFromId = -1;
+    _lastLoopToId = -1;
+
+    if (currentIndex - _lastLoopFrame < _loopCooldown)
+        return false;
+
+    struct Candidate
+    {
+        const KeyFrame* kf;
+        float dist;
+    };
+    std::vector<Candidate> scored;
     for (const auto& kf : _keyFrames)
     {
-        // 최근 프레임은 제외
         if (currentIndex - kf.index < _minFrameGap) continue;
+        bool alreadyDetected = false;
+        for (int id : _detectedFromIds)
+            if (id == kf.index) { alreadyDetected = true; break; }
+        if (alreadyDetected) continue;
 
-        // 현재 위치와 키프레임 위치 사이의 거리 계산
         float dx = currentPos[0] - kf.position[0];
         float dy = currentPos[1] - kf.position[1];
         float dz = currentPos[2] - kf.position[2];
         float dist = std::sqrt(dx*dx + dy*dy + dz*dz);
-
         if (dist < _searchRadius)
-            candidates.push_back(&kf);
+            scored.push_back({&kf, dist});
     }
 
-    if (candidates.empty())
+    if (scored.empty())
     {
         std::cout << "[LoopCloser] 후보 없음" << std::endl;
         return false;
     }
 
+    std::sort(scored.begin(), scored.end(),
+              [](const Candidate& a, const Candidate& b){ return a.dist < b.dist; });
+
+    int toCheck = std::min(_topNCandidates, (int)scored.size());
+    std::vector<Candidate> candidates;
+    for (int i = 0; i < toCheck; ++i)
+        candidates.push_back(scored[i]);
+
     std::cout << "[LoopCloser] 후보 " << candidates.size() << "개 발견, ICP 검증 중..." << std::endl;
 
-    // 2. 후보마다 ICP 실행해서 루프 확인
-    for (const auto* kf : candidates)
+    for (const auto& cand : candidates)
     {
-        // 키프레임 위치 기준으로 초기 translation 설정
-        // 두 스캔 모두 로컬 좌표이므로 위치 차이를 초기값으로 넘겨 수렴 가능성을 높임
-        Matrix3x3 initR = {1,0,0, 0,1,0, 0,0,1};
-        std::array<float,3> initT = {
-            kf->position[0] - currentPos[0],
-            kf->position[1] - currentPos[1],
-            kf->position[2] - currentPos[2]
+        const KeyFrame* kf = cand.kf;
+
+        // GTSAM이 이미 추정한 두 키프레임의 절대 pose로 상대 변환을 직접 계산
+        // (GLIM의 T_target^-1 * T_source 방식) — 무작위 각도 추측보다 신뢰도 높은 초기값
+        Matrix3x3 invKfR = {
+            kf->rotation[0], kf->rotation[3], kf->rotation[6],
+            kf->rotation[1], kf->rotation[4], kf->rotation[7],
+            kf->rotation[2], kf->rotation[5], kf->rotation[8]
         };
-        ICPResult icp = runICP(currentPoints, kf->points, 30, 1e-4f, &initR, &initT, true);
+        std::array<float,3> dPos = {
+            currentPos[0] - kf->position[0],
+            currentPos[1] - kf->position[1],
+            currentPos[2] - kf->position[2]
+        };
+        std::array<float,3> initT = {
+            invKfR[0]*dPos[0] + invKfR[1]*dPos[1] + invKfR[2]*dPos[2],
+            invKfR[3]*dPos[0] + invKfR[4]*dPos[1] + invKfR[5]*dPos[2],
+            invKfR[6]*dPos[0] + invKfR[7]*dPos[1] + invKfR[8]*dPos[2]
+        };
+        Matrix3x3 initR = {};
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                for (int k = 0; k < 3; ++k)
+                    initR[i*3+j] += invKfR[i*3+k] * currentRot[k*3+j];
+
+        ICPResult bestIcp = runICP(currentPoints, kf->points, 20, 1e-4f, &initR, &initT, true);
 
         std::cout << "[LoopCloser] 프레임 " << kf->index
-                  << " ICP 오차: " << icp.error << std::endl;
+                  << " ICP 오차: " << bestIcp.error
+                  << " | fitness: " << bestIcp.fitness << std::endl;
 
-        if (icp.error < _icpThreshold)
+        if (bestIcp.error < _icpThreshold && bestIcp.fitness > _minFitness)
         {
-            // 3. 루프 감지 — 경로 보정
-            // ICP가 현재 포인트 클라우드를 키프레임 클라우드로 정렬하면서
-            // 구한 이동량(icp.t)이 두 위치 사이의 실제 기하 오프셋입니다.
-            // 이전 구현은 icp.t를 버리고 위치 차이만 썼는데,
-            // icp.t를 반영해야 Odometry 드리프트가 정확히 제거됩니다.
-            std::array<float, 3> drift = {
-                currentPos[0] - kf->position[0] - icp.t[0],
-                currentPos[1] - kf->position[1] - icp.t[1],
-                currentPos[2] - kf->position[2] - icp.t[2]
+            std::cout << "[LoopCloser] 루프 감지! 프레임 " << kf->index << std::endl;
+
+            Matrix3x3 invR = {
+                bestIcp.R[0], bestIcp.R[3], bestIcp.R[6],
+                bestIcp.R[1], bestIcp.R[4], bestIcp.R[7],
+                bestIcp.R[2], bestIcp.R[5], bestIcp.R[8]
+            };
+            std::array<float,3> invT = {
+                -(invR[0]*bestIcp.t[0] + invR[1]*bestIcp.t[1] + invR[2]*bestIcp.t[2]),
+                -(invR[3]*bestIcp.t[0] + invR[4]*bestIcp.t[1] + invR[5]*bestIcp.t[2]),
+                -(invR[6]*bestIcp.t[0] + invR[7]*bestIcp.t[1] + invR[8]*bestIcp.t[2])
             };
 
-            std::cout << "[LoopCloser] 루프 감지! 프레임 " << kf->index
-                      << " | 누적 오차: ("
-                      << drift[0] << ", " << drift[1] << ", " << drift[2] << ")"
-                      << std::endl;
-
-            // 4. 루프 감지 이후 프레임들을 선형 보정
-            // 루프 발생 시점(kf->index) 이후 프레임부터 현재까지
-            // 오차를 균등하게 나눠서 줄여나감
-            int   loopStart  = kf->index;
-            int   loopEnd    = (int)trajectory.size() - 1;
-            int   loopLength = loopEnd - loopStart;
-
-            if (loopLength > 0)
-            {
-                for (int i = loopStart; i <= loopEnd; ++i)
-                {
-                    float ratio = (float)(i - loopStart) / (float)loopLength;
-                    trajectory[i][0] -= drift[0] * ratio;
-                    trajectory[i][1] -= drift[1] * ratio;
-                    trajectory[i][2] -= drift[2] * ratio;
-                }
-            }
+            _lastLoopFromId = kf->index;
+            _lastLoopToId = currentIndex;
+            _lastLoopRelativePose = {invR, invT};
+            _lastLoopFrame = currentIndex;
+            _detectedFromIds.push_back(kf->index);
 
             return true;
         }

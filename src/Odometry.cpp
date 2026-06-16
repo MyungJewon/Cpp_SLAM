@@ -1,94 +1,207 @@
-// LiDAR Odometry 구현: 연속 프레임 간 ICP로 누적 위치를 추적합니다.
 #include "Odometry.h"
 #include <iostream>
 #include <cmath>
+#include <algorithm>
+
+// ICP 회전 누적 시 발생하는 부동소수점 오차로 행렬이 직교성을 잃는 것을 방지
+// (groundMode가 꺼져 있으면 이 오차가 보정되지 않고 누적되어 GTSAM 최적화가 발산함)
+static Matrix3x3 orthonormalize(const Matrix3x3& R)
+{
+    float c0[3] = {R[0], R[3], R[6]};
+    float c1[3] = {R[1], R[4], R[7]};
+
+    float n0 = std::sqrt(c0[0]*c0[0] + c0[1]*c0[1] + c0[2]*c0[2]);
+    for (int i = 0; i < 3; ++i) c0[i] /= n0;
+
+    float dot01 = c0[0]*c1[0] + c0[1]*c1[1] + c0[2]*c1[2];
+    for (int i = 0; i < 3; ++i) c1[i] -= dot01 * c0[i];
+    float n1 = std::sqrt(c1[0]*c1[0] + c1[1]*c1[1] + c1[2]*c1[2]);
+    for (int i = 0; i < 3; ++i) c1[i] /= n1;
+
+    float c2[3] = {
+        c0[1]*c1[2] - c0[2]*c1[1],
+        c0[2]*c1[0] - c0[0]*c1[2],
+        c0[0]*c1[1] - c0[1]*c1[0]
+    };
+
+    return {
+        c0[0], c1[0], c2[0],
+        c0[1], c1[1], c2[1],
+        c0[2], c1[2], c2[2]
+    };
+}
+
+static Matrix3x3 multiplyMat(const Matrix3x3& A, const Matrix3x3& B)
+{
+    Matrix3x3 C = {};
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            for (int k = 0; k < 3; ++k)
+                C[i*3+j] += A[i*3+k] * B[k*3+j];
+    return C;
+}
+
+static Matrix3x3 transposeMat(const Matrix3x3& R)
+{
+    return {
+        R[0], R[3], R[6],
+        R[1], R[4], R[7],
+        R[2], R[5], R[8]
+    };
+}
+
+static std::array<float, 3> multiplyVec(const Matrix3x3& R,
+                                        const std::array<float, 3>& v)
+{
+    return {
+        R[0]*v[0] + R[1]*v[1] + R[2]*v[2],
+        R[3]*v[0] + R[4]*v[1] + R[5]*v[2],
+        R[6]*v[0] + R[7]*v[1] + R[8]*v[2]
+    };
+}
 
 Odometry::Odometry(float voxelSize)
     : _voxelSize(voxelSize)
     , _isFirst(true)
-    , _rotation({1,0,0, 0,1,0, 0,0,1})  // 단위행렬 (아무 회전 없음)
-    , _position({0, 0, 0})               // 원점에서 시작
+    , _rotation({1,0,0, 0,1,0, 0,0,1})
+    , _position({0, 0, 0})
+    , _localMap(_voxelSize)
 {
 }
 
-void Odometry::addFrame(const std::vector<std::array<float, 3>>& rawPoints)
+void Odometry::addFrame(const std::vector<std::array<float, 3>>& rawPoints,
+                        const std::vector<float>* pointTimes)
 {
-    // 1. 새 프레임 다운샘플링
-    auto currentFrame = voxelGridFilter(rawPoints, _voxelSize);
+    const std::vector<std::array<float, 3>>* filterInput = &rawPoints;
+    std::vector<std::array<float, 3>> deskewed;
 
-    // 2. 첫 프레임이면 월드 좌표계 로컬 맵의 기준으로 저장만 하고 종료
+    if (_imu && pointTimes && pointTimes->size() == rawPoints.size() && !pointTimes->empty())
+    {
+        deskewed = rawPoints;
+        double scanDuration = (double)*std::max_element(pointTimes->begin(), pointTimes->end());
+        Matrix3x3 REnd = _imu->getRotationAt(scanDuration);
+        Matrix3x3 REndInv = transposeMat(REnd);
+        std::array<float, 3> bodyVelocity = {0.0f, 0.0f, 0.0f};
+
+        if (_imuOdom)
+        {
+            auto pred = _imuOdom->predict();
+            bodyVelocity = multiplyVec(transposeMat(pred.R), pred.velocity);
+        }
+
+        for (size_t i = 0; i < rawPoints.size(); ++i)
+        {
+            Matrix3x3 RAtTi = _imu->getRotationAt((double)(*pointTimes)[i]);
+            // 점이 찍힌 시점의 자세를 스캔 종료 시점 자세로 맞춰 회전 왜곡을 줄입니다.
+            Matrix3x3 RRel = multiplyMat(REndInv, RAtTi);
+            deskewed[i] = multiplyVec(RRel, rawPoints[i]);
+            if (_imuOdom)
+            {
+                const float dtToScanEnd = static_cast<float>(scanDuration - (double)(*pointTimes)[i]);
+                deskewed[i][0] -= bodyVelocity[0] * dtToScanEnd;
+                deskewed[i][1] -= bodyVelocity[1] * dtToScanEnd;
+                deskewed[i][2] -= bodyVelocity[2] * dtToScanEnd;
+            }
+        }
+        filterInput = &deskewed;
+    }
+
+    auto currentFrame = voxelGridFilter(*filterInput, _voxelSize);
+
     if (_isFirst)
     {
         _lastFrame = currentFrame;
-        _localMap.insert(_localMap.end(), currentFrame.begin(), currentFrame.end());
-        _localMapFrameCount = 1;
+        _localMap.insert(currentFrame);
         _trajectory.push_back(_position);
         _isFirst = false;
         std::cout << "[Odometry] 첫 프레임 저장 (" << currentFrame.size() << "개 점)" << std::endl;
         return;
     }
 
-    // 3. 누적 로컬 맵과 ICP 실행 (Scan-to-Map)
-    //
-    // src = currentFrame (로컬/바디 좌표)
-    // dst = _localMap    (월드 좌표)
-    //
-    // 반드시 현재 pose(_rotation, _position)로 초기화해야 합니다.
-    // 그래야 로컬 포인트가 월드 좌표로 미리 변환되어 대응점 탐색이 가능합니다.
-    // ICP 결과 R, t는 "로컬 → 월드" 절대 변환입니다.
-    //
     // IMU 상태를 먼저 꺼내고 즉시 reset — ICP 성공·실패에 무관하게 누출 없음
     Matrix3x3 initR = _rotation;
     std::array<float, 3> initT = _position;
 
-    if (_imu)
+    std::array<float, 3> gravityUp = {0.0f, 0.0f, 1.0f};
+    bool hasGravity = false;
+
+    if (_imuOdom)
+    {
+        auto pred = _imuOdom->predict();
+        initR = pred.R;
+        initT = pred.t;
+
+        if (_imu)
+        {
+            hasGravity = _imu->getGravityUp(gravityUp);
+            _imu->reset();
+        }
+    }
+    else if (_imu)
     {
         bool hasSamples = (_imu->sampleCount() > 0);
         Matrix3x3 imuR  = _imu->getRotation();
+        hasGravity = _imu->getGravityUp(gravityUp);
         _imu->reset();
 
         if (hasSamples)
         {
-            // IMU 회전을 현재 누적 회전에 합성해 초기값으로 사용
-            Matrix3x3 composedR = {};
-            for (int i = 0; i < 3; ++i)
-                for (int j = 0; j < 3; ++j)
-                    for (int k = 0; k < 3; ++k)
-                        composedR[i*3+j] += imuR[i*3+k] * _rotation[k*3+j];
-            initR = composedR;
+            initR = multiplyMat(imuR, _rotation);
         }
     }
 
-    ICPResult icp = runICP(currentFrame, _localMap, 20, 1e-4f, &initR, &initT, true);
+    auto localMapVec = _localMap.toVector();
+    ICPResult icp = runICP(currentFrame, localMapVec, 20, 1e-4f, &initR, &initT, true);
 
-    // 4. 포즈 갱신
-    // Scan-to-Map ICP 결과는 "로컬 → 월드" 절대 변환이므로 직접 교체합니다.
-    //
-    // 비정상 점프 판정: 이전 위치와 새 위치 사이의 거리로 계산합니다.
     float dx = icp.t[0] - _position[0];
     float dy = icp.t[1] - _position[1];
     float dz = icp.t[2] - _position[2];
     float stepDist = std::sqrt(dx*dx + dy*dy + dz*dz);
+
     if (stepDist > _maxStepDist)
     {
         std::cout << "[Odometry] 경고: 프레임 " << _trajectory.size()+1
                   << " ICP 점프 무시 (step=" << stepDist << "m > " << _maxStepDist << "m)" << std::endl;
+        // update()를 호출하지 않더라도 프리인테그레이션 버퍼는 비워야 함.
+        // 안 비우면 다음 프레임에서도 계속 누적되어 예측이 갈수록 더 길게
+        // 외삽되고, 그 오차가 기하급수적으로 커져 영원히 복구되지 않음.
+        if (_imuOdom) _imuOdom->resetIntegration();
         _trajectory.push_back(_position);
         _lastFrame = currentFrame;
         return;
     }
 
-    _position = icp.t;
-    _rotation = icp.R;
+    // 포즈와 로컬 맵을 갱신하지 않아 노이즈 누적을 방지합니다.
+    float angle = std::acos(std::max(-1.0f, std::min(1.0f,
+        (icp.R[0] + icp.R[4] + icp.R[8] - 1.0f) * 0.5f))) * (180.0f / 3.14159265f);
+    if (stepDist < _stationaryStepM && angle < _stationaryAngleDeg)
+    {
+        if (_imuOdom) _imuOdom->resetIntegration();
+        _trajectory.push_back(_position);
+        _lastFrame = currentFrame;
+        return;
+    }
 
-    // 5-b. 지면 구속 모드: z 고정 + Roll/Pitch 제거
+    if (_imuOdom)
+    {
+        auto opt = _imuOdom->update(icp.R, icp.t, icp.fitness);
+        _position = opt.t;
+        _rotation = orthonormalize(opt.R);
+        _imuOdom->resetIntegration();
+    }
+    else
+    {
+        _position = icp.t;
+        _rotation = orthonormalize(icp.R);
+    }
+    (void)hasGravity;
+    (void)gravityUp;
+
     // 평지 주행 데이터에서 ICP의 z축 오차 누적을 방지합니다.
-    // 회전행렬에서 Yaw(수평 회전각)만 남기고 재구성해요.
     if (_groundMode)
     {
         _position[2] = 0.0f;
 
-        // Yaw 추출: R[1][0] / R[0][0] = sin(yaw) / cos(yaw)
         float yaw = std::atan2(_rotation[3], _rotation[0]);
         float c = std::cos(yaw), s = std::sin(yaw);
         _rotation = { c, -s, 0.0f,
@@ -96,34 +209,17 @@ void Odometry::addFrame(const std::vector<std::array<float, 3>>& rawPoints)
                       0.0f, 0.0f, 1.0f };
     }
 
-    // 6. 현재 프레임을 월드 좌표계로 변환해 로컬 맵에 누적
-    _localMap.reserve(_localMap.size() + currentFrame.size());
-    for (const auto& p : currentFrame)
-    {
+    for (const auto& p : currentFrame) {
         std::array<float, 3> pWorld = {
-            _rotation[0]*p[0] + _rotation[1]*p[1] + _rotation[2]*p[2] + _position[0],
-            _rotation[3]*p[0] + _rotation[4]*p[1] + _rotation[5]*p[2] + _position[1],
-            _rotation[6]*p[0] + _rotation[7]*p[1] + _rotation[8]*p[2] + _position[2]
+            _rotation[0]*p[0]+_rotation[1]*p[1]+_rotation[2]*p[2]+_position[0],
+            _rotation[3]*p[0]+_rotation[4]*p[1]+_rotation[5]*p[2]+_position[1],
+            _rotation[6]*p[0]+_rotation[7]*p[1]+_rotation[8]*p[2]+_position[2]
         };
-        _localMap.push_back(pWorld);
+        _localMap.insert(pWorld);
     }
-    ++_localMapFrameCount;
+    _localMap.trimToMax(_localMapMaxPts);
 
-    // 로컬 맵 크기를 항상 _localMapMaxPts 이하로 유지
-    // KD-Tree 빌드 비용이 점 개수에 비례하므로 상한을 타이트하게 잡습니다.
-    if (_localMap.size() > (size_t)_localMapMaxPts)
-    {
-        _localMap = voxelGridFilter(_localMap, _voxelSize);
-        _localMapFrameCount = 0;
-        // 필터 후에도 초과 시 강제 절삭 (voxelSize가 너무 작은 경우 대비)
-        if (_localMap.size() > (size_t)_localMapMaxPts)
-            _localMap.resize(_localMapMaxPts);
-    }
-
-    // 7. 마지막 다운샘플링 프레임 교체
     _lastFrame = currentFrame;
-
-    // 8. 경로 기록
     _trajectory.push_back(_position);
 
     std::cout << "[Odometry] 프레임 " << _trajectory.size()

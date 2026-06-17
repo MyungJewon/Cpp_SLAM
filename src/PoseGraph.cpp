@@ -8,9 +8,12 @@
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/slam/BetweenFactor.h>
 #include <gtsam/slam/PriorFactor.h>
+#include <gtsam/navigation/AttitudeFactor.h>
+#include <gtsam/geometry/Unit3.h>
 #include <gtsam/linear/NoiseModel.h>
 
 #include <stdexcept>
+#include <cmath>
 
 namespace
 {
@@ -70,6 +73,11 @@ struct PoseGraph::Impl
         diagonalNoise(0.1, 0.1, 0.1, 0.2, 0.2, 0.2));
     gtsam::SharedNoiseModel priorNoise =
         diagonalNoise(1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6);
+
+    // 자세 factor 기준 "위"(월드 좌표). 첫 중력 측정으로 1회 설정.
+    // (0,0,1)을 강제하지 않고 시작 자세 대비 drift만 막는다 — 센서 비수평 장착 대응.
+    gtsam::Unit3 worldUpRef;
+    bool worldUpSet = false;
 };
 
 PoseGraph::PoseGraph()
@@ -95,7 +103,8 @@ void PoseGraph::init(const Pose3D& firstPose)
     _impl->estimate = _impl->isam.calculateEstimate();
 }
 
-Pose3D PoseGraph::addOdometry(const Pose3D& deltaPose)
+Pose3D PoseGraph::addOdometry(const Pose3D& deltaPose,
+                             const std::array<float, 3>* gravityBodyUp)
 {
     const int fromId = _currentId;
     const int toId = _currentId + 1;
@@ -107,6 +116,32 @@ Pose3D PoseGraph::addOdometry(const Pose3D& deltaPose)
     gtsam::Values initial;
     graph.add(gtsam::BetweenFactor<gtsam::Pose3>(key(fromId), key(toId), delta, _impl->odomNoise));
     initial.insert(key(toId), predicted);
+
+    // IMU 중력 자세 factor: 바디 "위"(bRef)가 월드 up(nZ=(0,0,1))에 정렬되도록.
+    // pitch/roll 2-DOF만 구속(yaw 자유). loose noise라 LiDAR가 국소적으로 지배하되
+    // 전역 pitch 드리프트는 중력으로 묶인다.
+    if (gravityBodyUp)
+    {
+        const auto& g = *gravityBodyUp;
+        float n = std::sqrt(g[0]*g[0] + g[1]*g[1] + g[2]*g[2]);
+        if (n > 1e-6f)
+        {
+            gtsam::Unit3 bRef(g[0]/n, g[1]/n, g[2]/n);
+
+            // 첫 측정에서 월드 기준 up을 캡처: nZ = R_node * g_body (현재 추정 자세로
+            // 바디 중력을 월드로 회전). 이후 모든 factor가 이 기준에 맞춰 자세 drift만 억제.
+            if (!_impl->worldUpSet)
+            {
+                gtsam::Point3 gw = predicted.rotation().rotate(gtsam::Point3(g[0]/n, g[1]/n, g[2]/n));
+                _impl->worldUpRef = gtsam::Unit3(gw);
+                _impl->worldUpSet = true;
+            }
+
+            auto attNoise = gtsam::noiseModel::Isotropic::Sigma(2, _attitudeSigma);
+            graph.add(gtsam::AttitudeFactor<gtsam::Pose3>(
+                key(toId), _impl->worldUpRef, attNoise, bRef));
+        }
+    }
 
     _impl->isam.update(graph, initial);
     _impl->estimate = _impl->isam.calculateEstimate();

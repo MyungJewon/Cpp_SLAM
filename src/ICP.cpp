@@ -383,6 +383,9 @@ static bool computePointToPlaneStep(const std::vector<std::array<float, 3>>& mat
     if (!solveGaussian6x6(A, b, x))
         return false;
 
+    for (int i = 0; i < 6; ++i)
+        if (!std::isfinite(x[i])) return false;  // 발산/특이해 차단
+
     std::array<float, 3> w = {x[0], x[1], x[2]};
     R = rodrigues(w);
     t = {x[3], x[4], x[5]};
@@ -505,6 +508,8 @@ static bool computeGICPStep(const std::vector<std::array<float, 3>>& matchedSrc,
     float x[6] = {};
     if (!solveGaussian6x6(A, b, x))
         return false;
+    for (int i = 0; i < 6; ++i)
+        if (!std::isfinite(x[i])) return false;  // 발산/특이해 차단
 
     std::array<float, 3> w = {x[0], x[1], x[2]};
     R = rodrigues(w);

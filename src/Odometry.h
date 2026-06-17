@@ -34,6 +34,14 @@ public:
     // addFrame()에서 다운샘플링한 프레임 반환 — 외부에서 재활용해 중복 필터링 방지
     const std::vector<std::array<float, 3>>& getLastFrame() const { return _lastFrame; }
 
+    // 마지막 프레임에서 추정한 중력 "위"(바디 좌표) 반환 — back-end 자세 factor용.
+    // 유효하면 true. (IMU 샘플 있을 때만 유효)
+    bool getLastGravityUp(std::array<float, 3>& out) const
+    {
+        out = _lastGravityUp;
+        return _lastHasGravity;
+    }
+
     // 지면 구속 모드: z=0 고정, Yaw(수평 회전)만 추적
     void setGroundMode(bool enabled) { _groundMode = enabled; }
 
@@ -82,4 +90,6 @@ private:
     float _stationaryStepM    = 0.03f;  // 정지 판단 이동 임계값 (m)
     float _stationaryAngleDeg = 0.5f;   // 정지 판단 회전 임계값 (도)
     float _gravityScale       = 0.0f;   // 중력 prior 가중치 (0=비활성). 게이팅 재설계 전까지 끔.
+    std::array<float, 3> _lastGravityUp = {0.0f, 0.0f, 1.0f};  // 마지막 프레임 중력(바디)
+    bool _lastHasGravity = false;
 };

@@ -344,7 +344,12 @@ int main(int argc, char* argv[])
             else
             {
                 Pose3D delta = relativePose(prevPose, currentPose);
-                poseGraph.addOdometry(delta);
+                // B1 자세 factor: 가속도계 중력이 이 데이터에서 신뢰 불가로 판명되어
+                // 현재 비활성. 신뢰 가능한 IMU/캘리브레이션 확보 후 재활성.
+                const bool useAttitudeFactor = false;
+                std::array<float, 3> gUp;
+                bool hasG = useAttitudeFactor && bagOdom.getLastGravityUp(gUp);
+                poseGraph.addOdometry(delta, hasG ? &gUp : nullptr);
             }
             prevPose = currentPose;
 
@@ -407,8 +412,10 @@ int main(int argc, char* argv[])
 
         bag.close();
 
-        // 모든 프레임 처리 후 GTSAM이 충분히 수렴한 최종 포즈로 맵을 한 번만 재구성
-        if (loopCount > 0)
+        // 모든 프레임 처리 후 포즈그래프 최적화 결과(자세 factor + 루프 포함)로
+        // 궤적/맵을 항상 재구성한다. 루프가 없어도 자세 factor가 pitch/z 드리프트를
+        // 보정하므로 front-end 궤적보다 우수하다.
+        if (poseGraph.getCurrentId() > 0)
         {
             const auto finalPoses = poseGraph.getAllPoses();
             bagMap.rebuildFromPoses(finalPoses);

@@ -2,6 +2,7 @@
 build/
 *.o
 *.dSYM/
+LEARNING.md
 
 # 실행 결과물
 output/

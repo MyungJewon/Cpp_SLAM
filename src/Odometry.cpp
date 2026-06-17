@@ -220,6 +220,10 @@ void Odometry::addFrame(const std::vector<std::array<float, 3>>& rawPoints,
         _imu->reset();
     }
 
+    // back-end 자세 factor용으로 이번 프레임 중력을 보존 (조기 return에도 유효)
+    _lastGravityUp = gravityUp;
+    _lastHasGravity = hasGravity;
+
     std::vector<std::array<float, 3>> localMapVec;
     localMapVec.reserve(_localMap.cells().size());
     for (const auto& kv : _localMap.cells())
@@ -242,6 +246,22 @@ void Odometry::addFrame(const std::vector<std::array<float, 3>>& rawPoints,
         std::cout << "[Odometry] 경고: 프레임 " << _trajectory.size()+1
                   << " ICP 품질 부족 (fitness=" << icp.fitness
                   << ", error=" << icp.error << ") 포즈 유지" << std::endl;
+        if (_imuOdom) _imuOdom->resetIntegration();
+        _trajectory.push_back(_position);
+        _lastFrame = currentFrame;
+        _hasPrevDelta = false;
+        return;
+    }
+
+    // NaN/Inf 결과 거부 — degenerate 프레임에서 ICP가 발산하면 포즈그래프(GTSAM)가
+    // 터지므로, 비유한값이면 이번 프레임을 버리고 직전 포즈 유지.
+    bool icpFinite = std::isfinite(icp.t[0]) && std::isfinite(icp.t[1]) && std::isfinite(icp.t[2]);
+    for (int i = 0; i < 9 && icpFinite; ++i)
+        icpFinite = std::isfinite(icp.R[i]);
+    if (!icpFinite)
+    {
+        std::cout << "[Odometry] 경고: 프레임 " << _trajectory.size()+1
+                  << " ICP 결과 NaN/Inf — 프레임 무시" << std::endl;
         if (_imuOdom) _imuOdom->resetIntegration();
         _trajectory.push_back(_position);
         _lastFrame = currentFrame;

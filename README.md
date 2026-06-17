@@ -14,9 +14,13 @@ ROS1 Bag
   │                                                 └── Odometry (Scan-to-Map Voxel-GICP)
   │                                                       ├── Constant Velocity 예측
   │                                                       ├── Innovation Gating
-  │                                                       ├── IMUPreintegrator (Loose Coupling)
+  │                                                       ├── IMUPreintegrator (회전 deskew)
   │                                                       └── LoopCloser
-  └── IMU ──→ IMUPreintegrator ──→ ICP 초기 회전 힌트
+  └── IMU ──→ IMUPreintegrator ──→ 회전 deskew / gravity 측정 보관
+
+옵션:
+  --imu    ImuOdometry 타이트커플링 실험 경로 활성화
+  기본값   타이트커플링 OFF
 
 Odometry ──→ MapBuilder ──→ output/slam_map.ply
                           ──→ output/slam_trajectory.ply
@@ -35,11 +39,12 @@ Odometry ──→ MapBuilder ──→ output/slam_map.ply
 | `VoxelMap` | per-voxel mean/covariance/normal 관리, PCA 기반 is_planar 판정 |
 | `KDTree` | 3D KD-Tree. ICP 대응점 탐색에 사용 |
 | `ICP` | Voxel-GICP. per-voxel Mahalanobis 가중치, point-to-plane fallback |
-| `IMUPreintegrator` | IMU 적분 (Rodrigues 공식). ICP 초기 회전값 제공 |
+| `IMUPreintegrator` | IMU 적분 (Rodrigues 공식). 회전 deskew와 gravity 측정 저장에 사용 |
+| `ImuOdometry` | GTSAM IMU preintegration 기반 타이트커플링 실험 경로. 기본 비활성, `--imu`에서만 사용 |
 | `Odometry` | Scan-to-Map 포즈 추정. Constant velocity 예측, sliding window 로컬 맵 |
 | `LoopCloser` | 반경 탐색 + ICP 검증 기반 루프 클로저 |
-| `PoseGraph` | 루프 클로저 결과 관리 |
-| `MapBuilder` | 전역 점군 누적 및 PLY 저장 |
+| `PoseGraph` | odometry/loop closure pose graph. attitude factor 인터페이스는 있으나 현재 비활성 |
+| `MapBuilder` | 전역 점군 누적, keyframe 저장, PLY 저장 |
 | `PangolinViewer` | 실시간 3D 시각화 |
 
 ---
@@ -84,6 +89,14 @@ KDTree k-NN 으로 source 점별 공분산을 O(N log N)에 추정 (brute-force 
   7. 수락된 프레임만 delta 갱신 및 맵 삽입
 ```
 
+### IMU / Gravity 상태
+
+- 기본 실행은 `ImuOdometry` 타이트커플링을 사용하지 않습니다.
+- IMU 샘플은 `IMUPreintegrator`에 들어가며, 현재는 회전 deskew와 gravity 측정 보관에 사용합니다.
+- `Odometry`와 `ICP`에는 gravity prior 연결 훅이 있지만 `_gravityScale = 0.0f`라 기본 비활성입니다.
+- `PoseGraph`에도 attitude factor 인터페이스가 있으나 현재 `main.cpp`에서 비활성입니다.
+- `--imu` 옵션을 주면 GTSAM 기반 `ImuOdometry` 타이트커플링 실험 경로가 켜집니다.
+
 ---
 
 ## 빌드
@@ -127,6 +140,12 @@ build/slam data.bag /velodyne_points /imu/data
 
 # 예시 (Livox)
 build/slam data.bag /livox/lidar /livox/imu
+
+# 루프 클로저 비활성화
+build/slam data.bag /velodyne_points /imu/data --no-lc
+
+# IMU 타이트커플링 실험 경로 활성화
+build/slam data.bag /velodyne_points /imu/data --imu
 ```
 
 | 조작 | 동작 |
@@ -145,6 +164,9 @@ build/slam data.bag /livox/lidar /livox/imu
 | `output/slam_trajectory.ply` | 경로 점군 (ASCII PLY) |
 | `output/slam_map_2d.ppm` | 탑다운 2D 지도 이미지 |
 
+현재 `main.cpp`는 처리 종료 시 pose graph 결과로 `MapBuilder`를 재구성합니다.
+재구성은 저장된 keyframe 데이터를 사용하므로, 저장 주기와 pose graph 보정 여부가 최종 맵 밀도에 영향을 줍니다.
+
 ---
 
 ## 주요 파라미터 (`main.cpp`)
@@ -157,6 +179,8 @@ build/slam data.bag /livox/lidar /livox/imu
 | `_voxelSize` | 0.5m | Voxel 크기 |
 | `setEigenFloor` | 1e-3 | 공분산 고유값 상대 플로어 |
 | `kMinCovPoints` (ICP) | 6 | 대응에 쓸 voxel 최소 점수 |
+| `useImuOdom` | false | 기본 IMU 타이트커플링 비활성. `--imu` 옵션에서 활성 |
+| `_gravityScale` | 0.0 | front-end gravity prior 비활성 |
 
 ---
 
@@ -175,15 +199,16 @@ build/slam data.bag /livox/lidar /livox/imu
 - [x] Pangolin 실시간 뷰어
 - [x] PLY / PPM 출력
 - [x] **순수 LiDAR front-end 안정화** (freeway 전 구간 끊김 없이 추적)
+- [x] IMU 타이트커플링 실험 옵션 (`--imu`) 추가
 
 ### 진행 중 / 향후 과제 (back-end 통합)
 - [ ] Loop Closure 연결 정비 (포즈그래프 경유로 통일)
 - [ ] PoseGraph 최적화 (iSAM2 증분화)
-- [ ] IMU preintegration factor (back-end tight coupling)
+- [ ] IMU preintegration factor 안정화 (현재 `--imu` 실험 경로)
 - [ ] Z 잔여 드리프트 보정 (back-end로)
 
-> 참고: front-end 중력 prior(IMU 가속도)는 주행 중 가속도계 편향으로 불안정해 제외.
-> IMU는 back-end preintegration factor로만 사용 예정.
+> 참고: front-end gravity prior와 PoseGraph attitude factor는 구현 훅은 있으나 현재 기본 비활성입니다.
+> IMU 타이트커플링은 `--imu` 옵션으로 분리해 실험합니다.
 
 ---
 

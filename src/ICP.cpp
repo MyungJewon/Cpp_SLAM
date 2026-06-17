@@ -1,6 +1,8 @@
 #include "ICP.h"
+#include "VoxelMap.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <numeric>
 #include <limits>
 
@@ -23,6 +25,15 @@ static std::array<float, 3> multiplyVec(const Matrix3x3& R, const std::array<flo
     };
 }
 
+static Matrix3x3 transposeMat(const Matrix3x3& R)
+{
+    return {
+        R[0], R[3], R[6],
+        R[1], R[4], R[7],
+        R[2], R[5], R[8]
+    };
+}
+
 static std::array<float, 3> crossVec(const std::array<float, 3>& a,
                                      const std::array<float, 3>& b)
 {
@@ -37,6 +48,13 @@ static float dotVec(const std::array<float, 3>& a,
                     const std::array<float, 3>& b)
 {
     return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+}
+
+[[maybe_unused]] static size_t voxelHash(int ix, int iy, int iz)
+{
+    return (size_t)((int64_t)ix * 73856093) ^
+           (size_t)((int64_t)iy * 19349663) ^
+           (size_t)((int64_t)iz * 83492791);
 }
 
 static Matrix3x3 rodrigues(const std::array<float, 3>& w)
@@ -107,6 +125,113 @@ static Matrix3x3 jacobiEigenvectors(Matrix3x3& M)
     return V;
 }
 
+static Matrix3x3 transformCovariance(const Matrix3x3& R, const Matrix3x3& C)
+{
+    return multiplyMat(multiplyMat(R, C), transposeMat(R));
+}
+
+static bool invertSymmetric3x3(const Matrix3x3& A, Matrix3x3& inv)
+{
+    float a = A[0], b = A[1], c = A[2];
+    float d = A[4], e = A[5], f = A[8];
+
+    float A00 = d*f - e*e;
+    float A01 = c*e - b*f;
+    float A02 = b*e - c*d;
+    float A11 = a*f - c*c;
+    float A12 = b*c - a*e;
+    float A22 = a*d - b*b;
+
+    float det = a*A00 + b*A01 + c*A02;
+    if (std::abs(det) < 1e-12f)
+        return false;
+
+    float invDet = 1.0f / det;
+    inv = {
+        A00 * invDet, A01 * invDet, A02 * invDet,
+        A01 * invDet, A11 * invDet, A12 * invDet,
+        A02 * invDet, A12 * invDet, A22 * invDet
+    };
+    return true;
+}
+
+static std::array<float, 3> multiplyCovVec(const Matrix3x3& A,
+                                           const std::array<float, 3>& v)
+{
+    return {
+        A[0]*v[0] + A[1]*v[1] + A[2]*v[2],
+        A[3]*v[0] + A[4]*v[1] + A[5]*v[2],
+        A[6]*v[0] + A[7]*v[1] + A[8]*v[2]
+    };
+}
+
+static std::vector<Matrix3x3> estimateCovariances(
+    const std::vector<std::array<float,3>>& pts, int k = 10)
+{
+    std::vector<Matrix3x3> covariances;
+    covariances.reserve(pts.size());
+
+    if (pts.size() < 3)
+    {
+        covariances.assign(pts.size(), {1e-3f,0,0, 0,1e-3f,0, 0,0,1e-3f});
+        return covariances;
+    }
+
+    KDTree tree;
+    tree.build(pts);
+
+    int neighborCount = std::max(3, std::min(k, (int)pts.size()));
+    for (const auto& p : pts)
+    {
+        std::vector<int> idx = tree.kNearestIdx(p, neighborCount);
+        int cnt = (int)idx.size();
+
+        std::array<float, 3> centroid = {0, 0, 0};
+        for (int i : idx)
+        {
+            centroid[0] += pts[i][0];
+            centroid[1] += pts[i][1];
+            centroid[2] += pts[i][2];
+        }
+        centroid[0] /= cnt;
+        centroid[1] /= cnt;
+        centroid[2] /= cnt;
+
+        Matrix3x3 C = {};
+        for (int i : idx)
+        {
+            std::array<float, 3> d = {
+                pts[i][0] - centroid[0],
+                pts[i][1] - centroid[1],
+                pts[i][2] - centroid[2]
+            };
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 3; ++c)
+                    C[r*3+c] += d[r] * d[c] / (float)cnt;
+        }
+
+        // VGICP 공분산 정규화: 고유값 상대 플로어 (dst와 동일 방식)
+        Matrix3x3 eig = C;
+        Matrix3x3 V = jacobiEigenvectors(eig);
+        float lamMax = std::max(eig[0], std::max(eig[4], eig[8]));
+        float fl = std::max(lamMax, 1e-12f) * 1e-3f;
+        std::array<float, 3> lam = {
+            std::max(eig[0], fl), std::max(eig[4], fl), std::max(eig[8], fl)
+        };
+        Matrix3x3 Creg = {};
+        for (int r = 0; r < 3; ++r)
+            for (int k = 0; k < 3; ++k)
+            {
+                float s = 0.0f;
+                for (int c = 0; c < 3; ++c) s += V[r*3+c] * lam[c] * V[k*3+c];
+                Creg[r*3+k] = s;
+            }
+        covariances.push_back(Creg);
+    }
+
+    return covariances;
+}
+
 static std::vector<std::array<float,3>> estimateNormals(
     const std::vector<std::array<float,3>>& pts, int k = 10)
 {
@@ -125,43 +250,27 @@ static std::vector<std::array<float,3>> estimateNormals(
     int neighborCount = std::max(3, std::min(k, (int)pts.size()));
     for (const auto& p : pts)
     {
-        std::vector<std::pair<float, int>> distances;
-        distances.reserve(pts.size());
-        for (int i = 0; i < (int)pts.size(); ++i)
-        {
-            float dx = pts[i][0] - p[0];
-            float dy = pts[i][1] - p[1];
-            float dz = pts[i][2] - p[2];
-            distances.push_back({dx*dx + dy*dy + dz*dz, i});
-        }
-
-        if (neighborCount < (int)distances.size())
-        {
-            std::nth_element(distances.begin(),
-                             distances.begin() + neighborCount,
-                             distances.end());
-        }
+        std::vector<int> idx = tree.kNearestIdx(p, neighborCount);
+        int cnt = (int)idx.size();
 
         std::array<float, 3> centroid = {0, 0, 0};
-        for (int i = 0; i < neighborCount; ++i)
+        for (int i : idx)
         {
-            const auto& n = pts[distances[i].second];
-            centroid[0] += n[0];
-            centroid[1] += n[1];
-            centroid[2] += n[2];
+            centroid[0] += pts[i][0];
+            centroid[1] += pts[i][1];
+            centroid[2] += pts[i][2];
         }
-        centroid[0] /= neighborCount;
-        centroid[1] /= neighborCount;
-        centroid[2] /= neighborCount;
+        centroid[0] /= cnt;
+        centroid[1] /= cnt;
+        centroid[2] /= cnt;
 
         Matrix3x3 C = {};
-        for (int i = 0; i < neighborCount; ++i)
+        for (int i : idx)
         {
-            const auto& n = pts[distances[i].second];
             std::array<float, 3> d = {
-                n[0] - centroid[0],
-                n[1] - centroid[1],
-                n[2] - centroid[2]
+                pts[i][0] - centroid[0],
+                pts[i][1] - centroid[1],
+                pts[i][2] - centroid[2]
             };
             for (int r = 0; r < 3; ++r)
                 for (int c = 0; c < 3; ++c)
@@ -280,6 +389,129 @@ static bool computePointToPlaneStep(const std::vector<std::array<float, 3>>& mat
     return true;
 }
 
+static bool computeGICPStep(const std::vector<std::array<float, 3>>& matchedSrc,
+                            const std::vector<std::array<float, 3>>& matchedCenters,
+                            const std::vector<Matrix3x3>& matchedSrcCovariances,
+                            const std::vector<Matrix3x3>& matchedDstCovariances,
+                            Matrix3x3& R,
+                            std::array<float, 3>& t,
+                            const std::array<float, 3>* gravityWorldUp = nullptr,
+                            float gravityScale = 0.0f)
+{
+    float A[6][6] = {};
+    float b[6] = {};
+    int validConstraints = 0;
+
+    for (int i = 0; i < (int)matchedSrc.size(); ++i)
+    {
+        const auto& p = matchedSrc[i];
+        const auto& q = matchedCenters[i];
+
+        // 결합 공분산 (양쪽 모두 고유값 플로어 적용됨 → 추가 정규화 불필요)
+        Matrix3x3 C = {};
+        for (int j = 0; j < 9; ++j)
+            C[j] = matchedSrcCovariances[i][j] + matchedDstCovariances[i][j];
+
+        Matrix3x3 W = {};
+        if (!invertSymmetric3x3(C, W))
+            continue;
+        ++validConstraints;
+
+        std::array<float, 3> residual = {
+            p[0] - q[0],
+            p[1] - q[1],
+            p[2] - q[2]
+        };
+        std::array<float, 3> Wr = multiplyCovVec(W, residual);
+
+        float J[3][6] = {
+            { 0.0f,  p[2], -p[1], 1.0f, 0.0f, 0.0f },
+            {-p[2], 0.0f,  p[0], 0.0f, 1.0f, 0.0f },
+            { p[1],-p[0], 0.0f, 0.0f, 0.0f, 1.0f }
+        };
+
+        for (int r = 0; r < 6; ++r)
+        {
+            float JrWr = 0.0f;
+            for (int m = 0; m < 3; ++m)
+                JrWr += J[m][r] * Wr[m];
+            b[r] -= JrWr;
+
+            for (int c = 0; c < 6; ++c)
+            {
+                float JWJ = 0.0f;
+                for (int m = 0; m < 3; ++m)
+                {
+                    float WJc = 0.0f;
+                    for (int n = 0; n < 3; ++n)
+                        WJc += W[m*3+n] * J[n][c];
+                    JWJ += J[m][r] * WJc;
+                }
+                A[r][c] += JWJ;
+            }
+        }
+    }
+
+    if (validConstraints < 10)
+        return false;
+
+    // 중력 prior (L2): roll/pitch soft constraint.
+    // v = result.R * g_body (현재 추정한 "위" 방향, 월드 좌표) 가 (0,0,1)에 맞도록.
+    // 오차 e0 = v × (0,0,1), 회전증분 ω에 대한 야코비안 J_g = v·tᵀ - (v·t)I.
+    // yaw 성분(t 방향)은 e0에 거의 기여하지 않아 자동으로 자유.
+    // 가중치는 회전 블록 평균 대각에 비례 — LiDAR 회전 구속이 약한 축(예: pitch)에서
+    // 상대적으로 중력이 지배하여 드리프트를 잡는다.
+    if (gravityWorldUp && gravityScale > 0.0f)
+    {
+        const auto& v = *gravityWorldUp;
+        const std::array<float, 3> tgt = {0.0f, 0.0f, 1.0f};
+        std::array<float, 3> e0 = crossVec(v, tgt);
+        float vDotT = dotVec(v, tgt);
+
+        float Jg[3][3];
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c)
+                Jg[r][c] = v[r] * tgt[c] - (r == c ? vDotT : 0.0f);
+
+        float rotDiagMean = (A[0][0] + A[1][1] + A[2][2]) / 3.0f;
+        float wg = gravityScale * rotDiagMean;
+
+        for (int r = 0; r < 3; ++r)
+        {
+            float JTe = 0.0f;
+            for (int m = 0; m < 3; ++m) JTe += Jg[m][r] * e0[m];
+            b[r] -= wg * JTe;
+            for (int c = 0; c < 3; ++c)
+            {
+                float JTJ = 0.0f;
+                for (int m = 0; m < 3; ++m) JTJ += Jg[m][r] * Jg[m][c];
+                A[r][c] += wg * JTJ;
+            }
+        }
+    }
+
+    // 적응형 Tikhonov 정규화 (degenerate 방향 처리).
+    // 고속도로 직선 구간처럼 진행방향 평행이동이 관측되지 않으면 해당 축의
+    // Hessian 대각이 거의 0이 된다. 회전/이동 블록 각각의 평균 대각에 비례한
+    // damping을 더하면, 잘 구속된 축은 거의 영향이 없고(대각 >> damping)
+    // 관측이 약한 축은 예측값(=초기 추정)으로 고정되어 노이즈 발산을 막는다.
+    float rotDiagMean   = (A[0][0] + A[1][1] + A[2][2]) / 3.0f;
+    float transDiagMean = (A[3][3] + A[4][4] + A[5][5]) / 3.0f;
+    float rotLambda   = 1e-2f * rotDiagMean   + 1e-9f;
+    float transLambda = 1e-2f * transDiagMean + 1e-9f;
+    for (int i = 0; i < 3; ++i) A[i][i] += rotLambda;
+    for (int i = 3; i < 6; ++i) A[i][i] += transLambda;
+
+    float x[6] = {};
+    if (!solveGaussian6x6(A, b, x))
+        return false;
+
+    std::array<float, 3> w = {x[0], x[1], x[2]};
+    R = rodrigues(w);
+    t = {x[3], x[4], x[5]};
+    return true;
+}
+
 static Matrix3x3 computeSVD(const Matrix3x3& H)
 {
     Matrix3x3 Ht = { H[0], H[3], H[6],
@@ -369,19 +601,31 @@ ICPResult runICP(const std::vector<std::array<float, 3>>& src,
                  int maxIterations, float tolerance,
                  const Matrix3x3* initialR,
                  const std::array<float, 3>* initialT,
-                 bool usePointToPlane)
+                 bool usePointToPlane,
+                 bool useGICP,
+                 const std::unordered_map<VoxelKey, VoxelCell, VoxelKeyHash>* voxelMap,
+                 float voxelSize,
+                 const std::array<float, 3>* gravityBodyUp,
+                 float gravityScale)
 {
+    (void)tolerance;
+
     ICPResult result;
     result.R = {1,0,0, 0,1,0, 0,0,1};
     result.t = {0, 0, 0};
     result.error = std::numeric_limits<float>::max();
     result.fitness = 0.0f;
+    result.iterations = 0;
 
     KDTree tree;
-    tree.build(dst);
+    if (!useGICP)
+        tree.build(dst);
     std::vector<std::array<float, 3>> dstNormals;
-    if (usePointToPlane)
+    if (!useGICP)
         dstNormals = estimateNormals(dst);
+    std::vector<Matrix3x3> srcCovariances;
+    if (useGICP)
+        srcCovariances = estimateCovariances(src);
 
     std::vector<std::array<float, 3>> current = src;
     if (initialR)
@@ -396,28 +640,79 @@ ICPResult runICP(const std::vector<std::array<float, 3>>& src,
         result.t = t0;
     }
 
-    const float maxDistSq = 0.35f * 0.35f;  // 반복 구조물(주차선/기둥) 간 거리보다 좁게 잡아 오매칭 방지
+    const float gicpMaxDist = std::max(0.5f, voxelSize * 1.25f);
+    const float maxDistSq = useGICP ? gicpMaxDist * gicpMaxDist : 0.35f * 0.35f;
+    // 공분산이 신뢰 가능할 최소 점수 (is_planar 게이트 대체)
+    const int kMinCovPoints = 6;
 
     for (int iter = 0; iter < maxIterations; ++iter)
     {
         std::vector<std::array<float, 3>> matchedSrc;
         std::vector<std::array<float, 3>> matchedDst;
         std::vector<std::array<float, 3>> matchedNormals;
-        float totalError = 0.0f;
+        std::vector<Matrix3x3> matchedSrcCovariances;
+        std::vector<Matrix3x3> matchedDstCovariances;
+        float totalPointToPlaneSquaredError = 0.0f;
 
-        for (const auto& p : current)
+        for (size_t pointIdx = 0; pointIdx < current.size(); ++pointIdx)
         {
+            const auto& p = current[pointIdx];
             std::array<float, 3> nearest;
             int nearestIdx = -1;
-            if (usePointToPlane)
+            if (useGICP && voxelMap)
+            {
+                const VoxelCell* nearestCell = nullptr;
+                float nearestDistSq = std::numeric_limits<float>::max();
+
+                int ix = (int)std::floor(p[0] / voxelSize);
+                int iy = (int)std::floor(p[1] / voxelSize);
+                int iz = (int)std::floor(p[2] / voxelSize);
+
+                for (int dx = -1; dx <= 1; ++dx) {
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        for (int dz = -1; dz <= 1; ++dz) {
+                            VoxelKey key{ix + dx, iy + dy, iz + dz};
+                            auto cellIt = voxelMap->find(key);
+                            if (cellIt == voxelMap->end()) continue;
+
+                            const VoxelCell& cell = cellIt->second;
+                            // VGICP: 평면 게이트 대신 공분산이 신뢰 가능한(점 충분한) voxel을
+                            // 모두 사용. 기하 가중은 공분산 W가 알아서 처리한다.
+                            if (cell.point_count < kMinCovPoints) continue;
+
+                            float cx = p[0] - cell.center[0];
+                            float cy = p[1] - cell.center[1];
+                            float cz = p[2] - cell.center[2];
+                            float distSq = cx*cx + cy*cy + cz*cz;
+                            if (distSq < nearestDistSq)
+                            {
+                                nearestDistSq = distSq;
+                                nearestCell = &cell;
+                            }
+                        }
+                    }
+                }
+
+                if (!nearestCell || nearestDistSq > maxDistSq) continue;
+
+                matchedSrc.push_back(p);
+                matchedDst.push_back(nearestCell->center);
+                matchedNormals.push_back(nearestCell->normal);
+                matchedSrcCovariances.push_back(
+                    transformCovariance(result.R, srcCovariances[pointIdx]));
+                matchedDstCovariances.push_back(nearestCell->covariance);
+                float residual = dotVec({p[0] - nearestCell->center[0],
+                                         p[1] - nearestCell->center[1],
+                                         p[2] - nearestCell->center[2]},
+                                        nearestCell->normal);
+                totalPointToPlaneSquaredError += residual * residual;
+                continue;
+            }
+            else
             {
                 nearestIdx = tree.nearestIdx(p);
                 if (nearestIdx < 0) continue;
                 nearest = dst[nearestIdx];
-            }
-            else
-            {
-                nearest = tree.nearest(p);
             }
 
             float dx = p[0] - nearest[0];
@@ -430,29 +725,43 @@ ICPResult runICP(const std::vector<std::array<float, 3>>& src,
             matchedSrc.push_back(p);
             matchedDst.push_back(nearest);
             if (usePointToPlane)
+            {
                 matchedNormals.push_back(dstNormals[nearestIdx]);
-            totalError += distSq;
+            }
+
+            float residual = dotVec({dx, dy, dz}, dstNormals[nearestIdx]);
+            totalPointToPlaneSquaredError += residual * residual;
         }
 
         if (matchedSrc.size() < 10) break;
 
-        result.fitness = current.empty() ? 0.0f
+        const float previousError = result.error;
+        const float inlierRatio = current.empty() ? 0.0f
             : (float)matchedSrc.size() / (float)current.size();
+        const float rmse = std::sqrt(totalPointToPlaneSquaredError / (float)matchedSrc.size());
 
-        totalError /= matchedSrc.size();
-
-        if (std::abs(result.error - totalError) < tolerance)
-        {
-            result.iterations = iter;
-            result.error = totalError;
-            break;
-        }
-        result.error = totalError;
+        result.fitness = inlierRatio;
+        result.error = rmse;
 
         Matrix3x3 R = {1,0,0, 0,1,0, 0,0,1};
         std::array<float, 3> t = {0, 0, 0};
 
-        if (usePointToPlane)
+        if (useGICP && voxelMap)
+        {
+            // 현재 추정 자세로 바디 "위"를 월드로 회전 → 중력 prior 입력
+            std::array<float, 3> gravityWorldUp;
+            const std::array<float, 3>* gravityArg = nullptr;
+            if (gravityBodyUp && gravityScale > 0.0f)
+            {
+                gravityWorldUp = multiplyVec(result.R, *gravityBodyUp);
+                gravityArg = &gravityWorldUp;
+            }
+            if (!computeGICPStep(matchedSrc, matchedDst,
+                                 matchedSrcCovariances, matchedDstCovariances,
+                                 R, t, gravityArg, gravityScale))
+                break;
+        }
+        else if (usePointToPlane)
         {
             if (!computePointToPlaneStep(matchedSrc, matchedDst, matchedNormals, R, t))
                 break;
@@ -508,6 +817,26 @@ ICPResult runICP(const std::vector<std::array<float, 3>>& src,
         result.t[2] = newT[2] + t[2];
 
         result.iterations = iter + 1;
+
+        const float deltaTranslationNorm = std::sqrt(dotVec(t, t));
+        float deltaRotationFrobenius = 0.0f;
+        for (int i = 0; i < 9; ++i)
+        {
+            const float identityValue = (i == 0 || i == 4 || i == 8) ? 1.0f : 0.0f;
+            const float diff = identityValue - R[i];
+            deltaRotationFrobenius += diff * diff;
+        }
+        deltaRotationFrobenius = std::sqrt(deltaRotationFrobenius);
+        const float errorImprovement =
+            std::isfinite(previousError) ? std::abs(previousError - rmse)
+                                         : std::numeric_limits<float>::max();
+
+        if (deltaTranslationNorm < 1e-4f &&
+            deltaRotationFrobenius < 1e-4f &&
+            errorImprovement < 1e-4f)
+        {
+            break;
+        }
     }
 
     return result;

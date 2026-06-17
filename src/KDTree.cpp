@@ -73,6 +73,55 @@ int KDTree::nearestIdx(const std::array<float, 3>& query) const
     return best ? best->index : -1;
 }
 
+// ── k-최근접 탐색 ────────────────────────────────────
+std::vector<int> KDTree::kNearestIdx(const std::array<float, 3>& query, int k) const
+{
+    // (거리, 인덱스) 최대 힙: heap.front()가 현재 후보 중 가장 먼 점
+    std::vector<std::pair<float, int>> heap;
+    heap.reserve(k + 1);
+    kNearestRecursive(root, query, 0, k, heap);
+
+    std::sort_heap(heap.begin(), heap.end());  // 거리 오름차순 정렬
+    std::vector<int> result;
+    result.reserve(heap.size());
+    for (const auto& pr : heap)
+        result.push_back(pr.second);
+    return result;
+}
+
+void KDTree::kNearestRecursive(KDNode* node, const std::array<float, 3>& query,
+                                int depth, int k,
+                                std::vector<std::pair<float, int>>& heap) const
+{
+    if (node == nullptr) return;
+
+    float dist = 0.0f;
+    for (int i = 0; i < 3; ++i)
+        dist += (node->point[i] - query[i]) * (node->point[i] - query[i]);
+
+    if ((int)heap.size() < k)
+    {
+        heap.push_back({dist, node->index});
+        std::push_heap(heap.begin(), heap.end());
+    }
+    else if (dist < heap.front().first)
+    {
+        std::pop_heap(heap.begin(), heap.end());
+        heap.back() = {dist, node->index};
+        std::push_heap(heap.begin(), heap.end());
+    }
+
+    int axis = depth % 3;
+    KDNode* first  = (query[axis] < node->point[axis]) ? node->left  : node->right;
+    KDNode* second = (query[axis] < node->point[axis]) ? node->right : node->left;
+
+    kNearestRecursive(first, query, depth + 1, k, heap);
+
+    float axisDist = (query[axis] - node->point[axis]) * (query[axis] - node->point[axis]);
+    if ((int)heap.size() < k || axisDist < heap.front().first)
+        kNearestRecursive(second, query, depth + 1, k, heap);
+}
+
 void KDTree::nearestRecursive(KDNode* node, const std::array<float, 3>& query,
                                int depth, KDNode*& best, float& bestDist) const
 {

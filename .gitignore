@@ -5,6 +5,7 @@ build/
 
 # 실행 결과물
 output/
+results/
 
 # macOS
 .DS_Store

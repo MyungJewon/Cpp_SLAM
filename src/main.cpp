@@ -24,7 +24,8 @@ void printUsage()
     std::cout << "사용법 (SLAM):      ./slam <bag파일> <포인트토픽> <IMU토픽> [옵션]" << std::endl;
     std::cout << "  예) ./slam data.bag /velodyne_points /imu" << std::endl;
     std::cout << "  옵션: --no-lc    루프 클로저 비활성화" << std::endl;
-    std::cout << "        --no-imu  IMU 타이트 커플링 비활성화 (회전 디스큐잉만 사용)" << std::endl;
+    std::cout << "        --imu     IMU 타이트 커플링 활성화" << std::endl;
+    std::cout << "        --no-imu  IMU 타이트 커플링 비활성화 (기본값, 회전 디스큐잉만 사용)" << std::endl;
 }
 
 void saveTrajectoryPly(const std::vector<std::array<float, 3>>& traj,
@@ -230,13 +231,15 @@ int main(int argc, char* argv[])
     }
 
     bool useLoopClosure = true;
-    bool useImuOdom = true;
+    bool useImuOdom = false;
     std::vector<std::string> posArgs;
     for (int i = 1; i < argc; ++i)
     {
         std::string a(argv[i]);
         if (a == "--no-lc" || a == "-nlc")
             useLoopClosure = false;
+        else if (a == "--imu")
+            useImuOdom = true;
         else if (a == "--no-imu" || a == "-nimu")
             useImuOdom = false;
         else
@@ -258,11 +261,11 @@ int main(int argc, char* argv[])
     std::cout << "  포인트 토픽    : " << pointsTopic << std::endl;
     std::cout << "  IMU 토픽       : " << imuTopic << std::endl;
     std::cout << "  루프 클로저    : " << (useLoopClosure ? "ON" : "OFF (--no-lc)") << std::endl;
-    std::cout << "  IMU 타이트커플링: " << (useImuOdom ? "ON" : "OFF (--no-imu, 회전 디스큐잉만 사용)") << std::endl;
+    std::cout << "  IMU 타이트커플링: " << (useImuOdom ? "ON (--imu)" : "OFF (기본값, 회전 디스큐잉만 사용)") << std::endl;
     std::cout << "\n--- Bag Parser + SLAM ---" << std::endl;
 
     BagParser        bag(bagPath, pointsTopic, imuTopic);
-    Odometry         bagOdom(0.3f);
+    Odometry         bagOdom(0.5f);
     MapBuilder       bagMap(0.3f, 10);
     PoseGraph        poseGraph;
     IMUPreintegrator imu;
@@ -271,6 +274,7 @@ int main(int argc, char* argv[])
     bool firstFrameDone = false;
 
     bagOdom.setGroundMode(false);
+    bagOdom.setMaxStepDist(3.5f);
     bagOdom.setImuPreintegrator(&imu);
     bagOdom.setLocalMapMaxPts(5000);
     bagOdom.setStationaryThresh(0.03f, 0.5f);

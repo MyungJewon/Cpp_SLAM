@@ -1,8 +1,10 @@
 // ICP 선언: 두 포인트 클라우드를 정렬해 이동/회전을 추정합니다.
 #pragma once
 #include <array>
+#include <unordered_map>
 #include <vector>
 #include "KDTree.h"
+#include "VoxelMap.h"
 
 // 3x3 행렬을 1차원 배열로 표현 (row-major)
 // [0][1][2]
@@ -29,4 +31,12 @@ ICPResult runICP(const std::vector<std::array<float, 3>>& src,
                  float            tolerance     = 1e-4f,
                  const Matrix3x3* initialR      = nullptr,
                  const std::array<float, 3>* initialT = nullptr,
-                 bool             usePointToPlane = false);
+                 bool             usePointToPlane = false,
+                 bool             useGICP = false,
+                 const std::unordered_map<VoxelKey, VoxelCell, VoxelKeyHash>* voxelMap = nullptr,
+                 float            voxelSize = 0.3f,
+                 // 중력 prior (L2): 바디 좌표계 "위" 단위벡터. nullptr이면 미사용.
+                 // result.R * gravityBodyUp 가 월드 up(0,0,1)에 맞도록 roll/pitch를
+                 // soft constraint로 구속 (yaw는 자유). GICP 경로에서만 적용.
+                 const std::array<float, 3>* gravityBodyUp = nullptr,
+                 float            gravityScale = 0.0f);

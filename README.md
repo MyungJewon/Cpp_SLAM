@@ -1,7 +1,7 @@
 # Cpp_SLAM
 
-외부 라이브러리 없이 C++17로 구현한 LiDAR SLAM 시스템입니다.  
-ROS1 bag 파일을 입력받아 실시간 3D 지도를 생성하고 Pangolin으로 시각화합니다.
+ROS 없이 C++17로 처음부터 구현한 LiDAR SLAM 시스템입니다.  
+ROS1 bag 파일을 입력받아 3D 지도를 생성하고 Pangolin으로 시각화합니다.
 
 ---
 
@@ -10,9 +10,10 @@ ROS1 bag 파일을 입력받아 실시간 3D 지도를 생성하고 Pangolin으�
 ```
 ROS1 Bag
   ├── PointCloud2 / Livox CustomMsg ──→ BagParser
-  │                                         └── VoxelGrid (0.3m 다운샘플링)
-  │                                                 └── Odometry (Scan-to-Map)
-  │                                                       ├── Point-to-Plane ICP
+  │                                         └── VoxelGrid (다운샘플링)
+  │                                                 └── Odometry (Scan-to-Map Voxel-GICP)
+  │                                                       ├── Constant Velocity 예측
+  │                                                       ├── Innovation Gating
   │                                                       ├── IMUPreintegrator (Loose Coupling)
   │                                                       └── LoopCloser
   └── IMU ──→ IMUPreintegrator ──→ ICP 초기 회전 힌트
@@ -31,58 +32,57 @@ Odometry ──→ MapBuilder ──→ output/slam_map.ply
 |------|------|
 | `BagParser` | ROS1 bag 파싱. PointCloud2 / Livox CustomMsg / IMU 지원 |
 | `VoxelGrid` | Voxel Grid Filter (다운샘플링) |
-| `KDTree` | 3D KD-Tree. ICP 대응점 탐색 및 법선 추정에 사용. `nearestIdx()` 지원 |
-| `ICP` | Point-to-Plane ICP. 법선은 k-NN(k=10) PCA로 추정, 6×6 선형 시스템으로 최적화 |
-| `IMUPreintegrator` | IMU 적분 (Rodrigues 공식). ICP 초기 회전값 제공 (Loose Coupling) |
-| `Odometry` | Scan-to-Map 포즈 추정. 슬라이딩 윈도우 로컬 맵 유지 |
-| `LoopCloser` | 반경 탐색 + Point-to-Plane ICP 검증 기반 루프 클로저 |
+| `VoxelMap` | per-voxel mean/covariance/normal 관리, PCA 기반 is_planar 판정 |
+| `KDTree` | 3D KD-Tree. ICP 대응점 탐색에 사용 |
+| `ICP` | Voxel-GICP. per-voxel Mahalanobis 가중치, point-to-plane fallback |
+| `IMUPreintegrator` | IMU 적분 (Rodrigues 공식). ICP 초기 회전값 제공 |
+| `Odometry` | Scan-to-Map 포즈 추정. Constant velocity 예측, sliding window 로컬 맵 |
+| `LoopCloser` | 반경 탐색 + ICP 검증 기반 루프 클로저 |
+| `PoseGraph` | 루프 클로저 결과 관리 |
 | `MapBuilder` | 전역 점군 누적 및 PLY 저장 |
-| `PangolinViewer` | 실시간 3D 시각화. SLAM은 백그라운드 쓰레드, Pangolin은 메인 쓰레드 |
+| `PangolinViewer` | 실시간 3D 시각화 |
 
 ---
 
 ## 알고리즘 상세
 
-### Point-to-Plane ICP
+### Voxel-GICP (Generalized ICP)
 
-Point-to-Point 대비 평면 방향 미끄러짐(tangential drift)을 억제합니다.
+Voxel 단위로 점군의 분포(mean, covariance)를 누적해 유지하고 Mahalanobis 거리 기반으로
+정합합니다. 평면 여부를 하드 게이트로 거르지 않고, **공분산이 기하(평면/선/구)를 인코딩**해
+가중을 결정하는 본래 VGICP 방식입니다.
 
 ```
-사전 처리 (루프 외부, 1회):
-  dstNormals = estimateNormals(dst, k=10)
-    └── 각 점의 k-NN → 공분산 PCA → 최소 고유벡터 = 법선
+VoxelMap 구성:
+  각 voxel → count, mean, covariance (누적 통계로 분포 추정), normal (최소 고유벡터)
+  공분산 정규화: 고유값 상대 플로어 — λ_i ← max(λ_i, λ_max · 1e-3)
+                 → 이방성(disc 모양) 보존 + 특이행렬 방지 (조건수 ≤ 1000)
 
 반복 (최대 20회):
-  1. 대응점 탐색: KDTree.nearestIdx() → 법선 조회
-  2. residual r_i = (p_i - q_i) · n_i
-  3. Jacobian J_i = [(p_i × n_i), n_i]  (6차원)
-  4. 정규방정식 A·x = b 구성 (6×6)
-  5. 가우스 소거법으로 [ω, t] 풀기
-  6. R = Rodrigues(ω), 누적 변환 갱신
-  7. 오차 수렴 시 종료
+  1. 현재 pose로 source 점 변환
+  2. voxel 조회로 대응점 탐색 (point_count >= 6 인 voxel만 — 공분산 신뢰 확보)
+  3. W = (C_src + C_dst)^{-1} 계산  (양쪽 모두 고유값 플로어 적용)
+  4. J^T W J · Δx = -J^T W r 정규방정식 풀기
+  5. 회전/이동 블록별 적응형 Tikhonov damping (degenerate 방향 안정화)
+  6. 변환 누적 후 수렴 판정:
+     delta_t norm < 1e-4 AND Frobenius(I-deltaR) < 1e-4 AND error 개선 < 1e-4
+  7. GICP fitness=0 시 point-to-point ICP로 fallback
+
+KDTree k-NN 으로 source 점별 공분산을 O(N log N)에 추정 (brute-force O(N²) 제거).
 ```
 
 ### Scan-to-Map Odometry
 
-매 프레임을 직전 1프레임이 아닌 누적 로컬 맵과 매칭합니다.
-
-- **로컬 맵**: 월드 좌표로 변환된 최근 프레임 점군 슬라이딩 윈도우
-- **크기 제한**: 최대 5,000점 (초과 시 Voxel Filter → 강제 절삭)
-- **포즈 갱신**: ICP 결과 = 절대 변환(로컬→월드) → `position = icp.t`, `rotation = icp.R`
-- **이상값 거부**: 프레임당 이동 거리 2.0m 초과 시 해당 프레임 무시
-- **지면 모드**: z=0 고정, Yaw만 추적 (평지 주행용)
-
-### IMU Loose Coupling
-
-- IMU 샘플을 Rodrigues 공식으로 적분 → 프레임 간 회전 추정
-- 현재 누적 회전에 IMU 회전을 합성해 ICP 초기값으로 사용
-- 매 프레임 사용 후 자동 reset (누적 없음)
-
-### Loop Closure
-
-- 현재 위치 반경 **10m** 내 키프레임을 후보로 탐색
-- 후보마다 Point-to-Plane ICP 검증 (오차 < 0.5 시 루프 확정)
-- 루프 구간을 선형 보간으로 경로 보정
+```
+매 프레임:
+  1. Constant velocity 예측: predictedT = position + lastDeltaT
+  2. 예측값으로 ICP 초기화
+  3. GICP 실행 (sliding window 로컬 맵 대상, 반경 50m)
+  4. Innovation gating: 예측 대비 편차 > max(2.0, predStep*3.0) AND fitness < 0.15 → 거부
+  5. maxStepDist(3.5m) 초과 → 거부
+  6. 정지 감지(0.03m 미만) → 포즈 고정, 맵만 업데이트
+  7. 수락된 프레임만 delta 갱신 및 맵 삽입
+```
 
 ---
 
@@ -94,7 +94,7 @@ Point-to-Point 대비 평면 방향 미끄러짐(tangential drift)을 억제합�
 # Eigen, GLEW
 brew install eigen glew
 
-# Pangolin (소스 빌드 필요 — brew cask와 다른 라이브러리)
+# Pangolin (소스 빌드)
 git clone --depth=1 https://github.com/stevenlovegrove/Pangolin.git
 cmake -S Pangolin -B Pangolin/build \
   -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DBUILD_PANGOLIN_FFMPEG=OFF \
@@ -108,7 +108,7 @@ sudo cmake --install Pangolin/build
 
 ```bash
 cmake -S . -B build
-cmake --build build -j8
+cmake --build build --parallel 4
 ```
 
 ---
@@ -129,8 +129,6 @@ build/slam data.bag /velodyne_points /imu/data
 build/slam data.bag /livox/lidar /livox/imu
 ```
 
-실행하면 Pangolin 뷰어가 열리며 실시간으로 점군과 경로가 표시됩니다.
-
 | 조작 | 동작 |
 |------|------|
 | 마우스 드래그 | 3D 뷰 회전 |
@@ -145,18 +143,20 @@ build/slam data.bag /livox/lidar /livox/imu
 |------|------|
 | `output/slam_map.ply` | 전역 점군 지도 (ASCII PLY) |
 | `output/slam_trajectory.ply` | 경로 점군 (ASCII PLY) |
-| `output/slam_map_2d.ppm` | 탑다운 2D 지도 이미지 (1024×1024) |
+| `output/slam_map_2d.ppm` | 탑다운 2D 지도 이미지 |
 
 ---
 
 ## 주요 파라미터 (`main.cpp`)
 
-| 설정 | 기본값 | 설명 |
+| 설정 | 현재값 | 설명 |
 |------|--------|------|
-| `setGroundMode(true)` | true | z=0 고정, Yaw만 추적 |
-| `setLocalMapMaxPts(5000)` | 5000 | ICP 대상 로컬 맵 최대 점 수. 많을수록 정확하지만 느림 |
-| `setMaxStepDist(2.0f)` | 2.0m | 프레임당 최대 허용 이동 거리. 초과 시 ICP 실패로 무시 |
-| `LoopCloser(10.0f, 0.5f, 50)` | — | 탐색 반경 10m / ICP 임계값 0.5 / 최소 프레임 간격 50 |
+| `setGroundMode(false)` | false | 씬 무관 3D 추적 |
+| `setMaxStepDist(3.5f)` | 3.5m | 프레임당 최대 허용 이동 거리 |
+| `_stationaryStepM` | 0.03m | 정지 판정 이동 임계값 |
+| `_voxelSize` | 0.5m | Voxel 크기 |
+| `setEigenFloor` | 1e-3 | 공분산 고유값 상대 플로어 |
+| `kMinCovPoints` (ICP) | 6 | 대응에 쓸 voxel 최소 점수 |
 
 ---
 
@@ -165,26 +165,30 @@ build/slam data.bag /livox/lidar /livox/imu
 ### 완료
 - [x] ROS1 bag 파싱 (PointCloud2, Livox CustomMsg, IMU)
 - [x] Voxel Grid Filter
-- [x] KD-Tree (nearestIdx 포함)
-- [x] Point-to-Plane ICP (법선 추정 포함)
-- [x] IMU Loose Coupling
-- [x] Scan-to-Map Odometry (슬라이딩 윈도우)
-- [x] 이상값 거부 (프레임당 최대 이동 거리)
-- [x] Loop Closure (반경 탐색 + ICP 검증 + 선형 경로 보정)
-- [x] Pangolin 실시간 뷰어 (macOS 메인 쓰레드 구조)
-- [x] PLY / PPM 출력 (실행 경로 무관한 절대 경로)
+- [x] KD-Tree (k-NN 포함)
+- [x] Voxel-GICP (per-voxel 누적 공분산, Mahalanobis weighting, 고유값 플로어 정규화)
+- [x] VoxelMap (분포 누적, 고유값 상대 플로어 — 평면 하드게이트 제거)
+- [x] Scan-to-Map Odometry (sliding window, constant velocity 예측)
+- [x] Innovation gating + 적응형 Tikhonov damping (degenerate 방향 안정화)
+- [x] 정지 감지 (포즈 고정, 맵 갱신 유지)
+- [x] 성능 최적화 (k-NN 공분산 O(N log N))
+- [x] Pangolin 실시간 뷰어
+- [x] PLY / PPM 출력
+- [x] **순수 LiDAR front-end 안정화** (freeway 전 구간 끊김 없이 추적)
 
-### 향후 과제
-- [ ] FPFH 기반 3D Feature 추출/매칭 (루프 클로저 강화)
-- [ ] Tight Coupling IMU (상태벡터에 IMU bias 포함)
-- [ ] Pose Graph Optimization (g2o / GTSAM)
-- [ ] 정지 감지를 통한 노이즈 억제
-- [ ] Voxel 맵 구조 (평면 모델 저장, FAST-LIVO2 방식)
+### 진행 중 / 향후 과제 (back-end 통합)
+- [ ] Loop Closure 연결 정비 (포즈그래프 경유로 통일)
+- [ ] PoseGraph 최적화 (iSAM2 증분화)
+- [ ] IMU preintegration factor (back-end tight coupling)
+- [ ] Z 잔여 드리프트 보정 (back-end로)
+
+> 참고: front-end 중력 prior(IMU 가속도)는 주행 중 가속도계 편향으로 불안정해 제외.
+> IMU는 back-end preintegration factor로만 사용 예정.
 
 ---
 
 ## 참고
 
-- [FAST-LIVO2](https://github.com/hku-mars/FAST-LIVO2) — 본 프로젝트의 알고리즘 참고 대상
-- [KISS-ICP](https://github.com/PRBonn/kiss-icp) — ICP만으로 실시간 SLAM을 구현한 최소 구현체
-- [LIO-SAM](https://github.com/TixiaoShan/LIO-SAM) — IMU + 포즈 그래프 기반 SLAM
+- [FAST-LIVO2](https://github.com/hku-mars/FAST-LIVO2)
+- [KISS-ICP](https://github.com/PRBonn/kiss-icp)
+- [LIO-SAM](https://github.com/TixiaoShan/LIO-SAM)

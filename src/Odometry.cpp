@@ -60,6 +60,65 @@ static std::array<float, 3> multiplyVec(const Matrix3x3& R,
     };
 }
 
+static float dotVec(const std::array<float, 3>& a,
+                    const std::array<float, 3>& b)
+{
+    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+}
+
+static std::array<float, 3> crossVec(const std::array<float, 3>& a,
+                                     const std::array<float, 3>& b)
+{
+    return {
+        a[1]*b[2] - a[2]*b[1],
+        a[2]*b[0] - a[0]*b[2],
+        a[0]*b[1] - a[1]*b[0]
+    };
+}
+
+static bool normalizeVec(std::array<float, 3>& v)
+{
+    float n = std::sqrt(dotVec(v, v));
+    if (n < 1e-6f) return false;
+    v[0] /= n;
+    v[1] /= n;
+    v[2] /= n;
+    return true;
+}
+
+static Matrix3x3 rodriguesAxisAngle(const std::array<float, 3>& axis,
+                                    float angle)
+{
+    float c = std::cos(angle);
+    float s = std::sin(angle);
+    float oneMinusC = 1.0f - c;
+    float x = axis[0], y = axis[1], z = axis[2];
+
+    return {
+        c + x*x*oneMinusC,     x*y*oneMinusC - z*s, x*z*oneMinusC + y*s,
+        y*x*oneMinusC + z*s,   c + y*y*oneMinusC,   y*z*oneMinusC - x*s,
+        z*x*oneMinusC - y*s,   z*y*oneMinusC + x*s, c + z*z*oneMinusC
+    };
+}
+
+[[maybe_unused]] static Matrix3x3 limitedAlignmentRotation(std::array<float, 3> from,
+                                          std::array<float, 3> to,
+                                          float maxAngleRad)
+{
+    Matrix3x3 I = {1,0,0, 0,1,0, 0,0,1};
+    if (!normalizeVec(from) || !normalizeVec(to)) return I;
+
+    float c = std::max(-1.0f, std::min(1.0f, dotVec(from, to)));
+    float angle = std::acos(c);
+    if (angle < 1e-5f) return I;
+
+    std::array<float, 3> axis = crossVec(from, to);
+    if (!normalizeVec(axis)) return I;
+
+    angle = std::min(angle, maxAngleRad);
+    return rodriguesAxisAngle(axis, angle);
+}
+
 Odometry::Odometry(float voxelSize)
     : _voxelSize(voxelSize)
     , _isFirst(true)
@@ -111,26 +170,44 @@ void Odometry::addFrame(const std::vector<std::array<float, 3>>& rawPoints,
     if (_isFirst)
     {
         _lastFrame = currentFrame;
-        _localMap.insert(currentFrame);
+        _localMap.insertAndUpdate(*filterInput, _position);
         _trajectory.push_back(_position);
         _isFirst = false;
         std::cout << "[Odometry] 첫 프레임 저장 (" << currentFrame.size() << "개 점)" << std::endl;
         return;
     }
 
-    // IMU 상태를 먼저 꺼내고 즉시 reset — ICP 성공·실패에 무관하게 누출 없음
-    Matrix3x3 initR = _rotation;
-    std::array<float, 3> initT = _position;
+    const std::array<float, 3> prevPosition = _position;
+    const Matrix3x3 prevRotation = _rotation;
 
+    Matrix3x3 predictedR = {};
+    std::array<float, 3> predictedT = {};
+    const Matrix3x3* initialR = nullptr;
+    const std::array<float, 3>* initialT = nullptr;
+
+    if (_hasPrevDelta)
+    {
+        predictedT = {
+            _position[0] + _lastDeltaT[0],
+            _position[1] + _lastDeltaT[1],
+            _position[2] + _lastDeltaT[2]
+        };
+        predictedR = multiplyMat(_lastDeltaR, _rotation);
+    }
+    else
+    {
+        predictedT = _position;
+        predictedR = _rotation;
+    }
+    initialR = &predictedR;
+    initialT = &predictedT;
+
+    // IMU 상태를 먼저 꺼내고 즉시 reset — ICP 성공·실패에 무관하게 누출 없음
     std::array<float, 3> gravityUp = {0.0f, 0.0f, 1.0f};
     bool hasGravity = false;
 
     if (_imuOdom)
     {
-        auto pred = _imuOdom->predict();
-        initR = pred.R;
-        initT = pred.t;
-
         if (_imu)
         {
             hasGravity = _imu->getGravityUp(gravityUp);
@@ -139,19 +216,38 @@ void Odometry::addFrame(const std::vector<std::array<float, 3>>& rawPoints,
     }
     else if (_imu)
     {
-        bool hasSamples = (_imu->sampleCount() > 0);
-        Matrix3x3 imuR  = _imu->getRotation();
         hasGravity = _imu->getGravityUp(gravityUp);
         _imu->reset();
-
-        if (hasSamples)
-        {
-            initR = multiplyMat(imuR, _rotation);
-        }
     }
 
-    auto localMapVec = _localMap.toVector();
-    ICPResult icp = runICP(currentFrame, localMapVec, 20, 1e-4f, &initR, &initT, true);
+    std::vector<std::array<float, 3>> localMapVec;
+    localMapVec.reserve(_localMap.cells().size());
+    for (const auto& kv : _localMap.cells())
+        localMapVec.push_back(kv.second.center);
+    const std::array<float, 3>* gravityArg =
+        (hasGravity && _gravityScale > 0.0f) ? &gravityUp : nullptr;
+    ICPResult icp = runICP(currentFrame, localMapVec, 20, 1e-4f,
+                           initialR, initialT, false, true,
+                           &_localMap.cells(), _voxelSize,
+                           gravityArg, _gravityScale);
+    if (icp.fitness <= 0.0f && !localMapVec.empty())
+    {
+        icp = runICP(currentFrame, localMapVec, 20, 1e-4f,
+                     initialR, initialT, false, false);
+    }
+
+    if (!std::isfinite(icp.error) || icp.fitness < 0.08f ||
+        (icp.error > _voxelSize * 0.6f && icp.fitness < 0.35f))
+    {
+        std::cout << "[Odometry] 경고: 프레임 " << _trajectory.size()+1
+                  << " ICP 품질 부족 (fitness=" << icp.fitness
+                  << ", error=" << icp.error << ") 포즈 유지" << std::endl;
+        if (_imuOdom) _imuOdom->resetIntegration();
+        _trajectory.push_back(_position);
+        _lastFrame = currentFrame;
+        _hasPrevDelta = false;
+        return;
+    }
 
     float dx = icp.t[0] - _position[0];
     float dy = icp.t[1] - _position[1];
@@ -168,8 +264,46 @@ void Odometry::addFrame(const std::vector<std::array<float, 3>>& rawPoints,
         if (_imuOdom) _imuOdom->resetIntegration();
         _trajectory.push_back(_position);
         _lastFrame = currentFrame;
+        _hasPrevDelta = false;  // 잘못된 예측 delta 리셋
         return;
     }
+
+    // Constant velocity 예측 대비 ICP 결과 괴리 검증 (innovation gating)
+    // 정지 상태(predStepLen < 0.1m)에서는 재출발 첫 이동을 막지 않도록 게이팅 생략
+    if (_hasPrevDelta)
+    {
+        float gx = icp.t[0] - predictedT[0];
+        float gy = icp.t[1] - predictedT[1];
+        float gz = icp.t[2] - predictedT[2];
+        float gatingDist = std::sqrt(gx*gx + gy*gy + gz*gz);
+        float predStepLen = std::sqrt(_lastDeltaT[0]*_lastDeltaT[0]
+                                    + _lastDeltaT[1]*_lastDeltaT[1]
+                                    + _lastDeltaT[2]*_lastDeltaT[2]);
+        // 실제로 이동 중일 때만 게이팅 적용 (정지→재출발 구간 제외)
+        if (predStepLen > 0.1f)
+        {
+            if (gatingDist > std::max(2.0f, predStepLen * 3.0f) && icp.fitness < 0.15f)
+            {
+                std::cout << "[Odometry] 경고: 프레임 " << _trajectory.size()+1
+                          << " ICP 결과 예측 괴리 (gating=" << gatingDist
+                          << "m, predStep=" << predStepLen
+                          << "m, fitness=" << icp.fitness << ") delta 리셋" << std::endl;
+                if (_imuOdom) _imuOdom->resetIntegration();
+                _trajectory.push_back(_position);
+                _lastFrame = currentFrame;
+                _hasPrevDelta = false;
+                return;
+            }
+        }
+    }
+
+    _lastDeltaT = {
+        icp.t[0] - prevPosition[0],
+        icp.t[1] - prevPosition[1],
+        icp.t[2] - prevPosition[2]
+    };
+    _lastDeltaR = multiplyMat(icp.R, transposeMat(prevRotation));
+    _hasPrevDelta = true;
 
     // 포즈와 로컬 맵을 갱신하지 않아 노이즈 누적을 방지합니다.
     float angle = std::acos(std::max(-1.0f, std::min(1.0f,
@@ -177,8 +311,20 @@ void Odometry::addFrame(const std::vector<std::array<float, 3>>& rawPoints,
     if (stepDist < _stationaryStepM && angle < _stationaryAngleDeg)
     {
         if (_imuOdom) _imuOdom->resetIntegration();
+        std::vector<std::array<float, 3>> worldFrameStationary;
+        worldFrameStationary.reserve(filterInput->size());
+        for (const auto& p : *filterInput) {
+            worldFrameStationary.push_back({
+                _rotation[0]*p[0]+_rotation[1]*p[1]+_rotation[2]*p[2]+_position[0],
+                _rotation[3]*p[0]+_rotation[4]*p[1]+_rotation[5]*p[2]+_position[1],
+                _rotation[6]*p[0]+_rotation[7]*p[1]+_rotation[8]*p[2]+_position[2]
+            });
+        }
+        _localMap.insertAndUpdate(worldFrameStationary, _position);
+        _localMap.slideWindow(_position, 50.0f);
         _trajectory.push_back(_position);
         _lastFrame = currentFrame;
+        _hasPrevDelta = false;  // 정지 후 재출발 시 stale velocity 예측 방지
         return;
     }
 
@@ -194,8 +340,10 @@ void Odometry::addFrame(const std::vector<std::array<float, 3>>& rawPoints,
         _position = icp.t;
         _rotation = orthonormalize(icp.R);
     }
-    (void)hasGravity;
-    (void)gravityUp;
+
+    // 중력 보정은 이제 GICP 내부 soft constraint(L2)로 처리한다.
+    // 후처리 snap은 LiDAR 신뢰도를 무시하고 매 프레임 강제로 당겨 이중 보정/충돌을
+    // 일으키므로 제거했다. (in-solver 방식이 LiDAR가 약한 축에서만 중력이 지배)
 
     // 평지 주행 데이터에서 ICP의 z축 오차 누적을 방지합니다.
     if (_groundMode)
@@ -209,15 +357,18 @@ void Odometry::addFrame(const std::vector<std::array<float, 3>>& rawPoints,
                       0.0f, 0.0f, 1.0f };
     }
 
-    for (const auto& p : currentFrame) {
+    std::vector<std::array<float, 3>> worldFrame;
+    worldFrame.reserve(filterInput->size());
+    for (const auto& p : *filterInput) {
         std::array<float, 3> pWorld = {
             _rotation[0]*p[0]+_rotation[1]*p[1]+_rotation[2]*p[2]+_position[0],
             _rotation[3]*p[0]+_rotation[4]*p[1]+_rotation[5]*p[2]+_position[1],
             _rotation[6]*p[0]+_rotation[7]*p[1]+_rotation[8]*p[2]+_position[2]
         };
-        _localMap.insert(pWorld);
+        worldFrame.push_back(pWorld);
     }
-    _localMap.trimToMax(_localMapMaxPts);
+    _localMap.insertAndUpdate(worldFrame, _position);
+    _localMap.slideWindow(_position, 50.0f);
 
     _lastFrame = currentFrame;
     _trajectory.push_back(_position);

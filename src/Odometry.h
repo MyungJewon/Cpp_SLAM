@@ -57,16 +57,23 @@ public:
     void setImuPreintegrator(IMUPreintegrator* imu) { _imu = imu; }
     void setImuOdometry(ImuOdometry* imuOdom) { _imuOdom = imuOdom; }
 
+    // 중력 prior(L2) 가중치. GICP 정규방정식의 회전 블록 평균 대각 대비 비율.
+    // 0이면 비활성. 중력 방향(IMU 가속도)으로 roll/pitch를 soft constraint.
+    void setGravityScale(float s) { _gravityScale = s; }
+
 private:
     float     _voxelSize;
     bool      _isFirst;
     bool      _groundMode    = false;
-    float     _maxStepDist   = 2.0f;   // 프레임당 최대 이동 거리 (m) — 초과 시 ICP 실패로 간주
+    float     _maxStepDist   = 5.0f;   // 프레임당 최대 이동 거리 (m) — 초과 시 ICP 실패로 간주
     IMUPreintegrator* _imu   = nullptr;
     ImuOdometry* _imuOdom    = nullptr;
 
     Matrix3x3                            _rotation;    // 누적 회전
     std::array<float, 3>                 _position;    // 누적 위치
+    Matrix3x3                            _lastDeltaR;
+    std::array<float, 3>                 _lastDeltaT = {0.f, 0.f, 0.f};
+    bool                                 _hasPrevDelta = false;
     std::vector<std::array<float, 3>>    _trajectory;  // 경로 기록
     std::vector<std::array<float, 3>>    _lastFrame;   // 마지막 다운샘플링 프레임
     VoxelMap                             _localMap;          // 월드 좌표계 로컬 맵
@@ -74,4 +81,5 @@ private:
 
     float _stationaryStepM    = 0.03f;  // 정지 판단 이동 임계값 (m)
     float _stationaryAngleDeg = 0.5f;   // 정지 판단 회전 임계값 (도)
+    float _gravityScale       = 0.0f;   // 중력 prior 가중치 (0=비활성). 게이팅 재설계 전까지 끔.
 };

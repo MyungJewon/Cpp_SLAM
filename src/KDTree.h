@@ -2,6 +2,7 @@
 #pragma once
 #include <vector>
 #include <array>
+#include <utility>
 
 // 트리를 구성하는 노드 하나
 struct KDNode
@@ -27,6 +28,9 @@ public:
     // query와 가장 가까운 점의 원본 배열 인덱스를 반환
     int nearestIdx(const std::array<float, 3>& query) const;
 
+    // query와 가장 가까운 k개 점의 원본 배열 인덱스를 거리 오름차순으로 반환
+    std::vector<int> kNearestIdx(const std::array<float, 3>& query, int k) const;
+
 private:
     struct IndexedPoint
     {
@@ -39,5 +43,8 @@ private:
     KDNode* buildRecursive(std::vector<IndexedPoint> points, int depth);
     void nearestRecursive(KDNode* node, const std::array<float, 3>& query,
                           int depth, KDNode*& best, float& bestDist) const;
+    void kNearestRecursive(KDNode* node, const std::array<float, 3>& query,
+                           int depth, int k,
+                           std::vector<std::pair<float, int>>& heap) const;
     void clear(KDNode* node);
 };

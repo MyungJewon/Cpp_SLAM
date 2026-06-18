@@ -13,6 +13,7 @@
 #include "ImuOdometry.h"
 #include "IMUPreintegrator.h"
 #include "LoopCloser.h"
+#include "SubmapBuilder.h"
 #include "MapBuilder.h"
 #include "Odometry.h"
 #include "PangolinViewer.h"
@@ -280,8 +281,28 @@ int main(int argc, char* argv[])
     bagOdom.setStationaryThresh(0.03f, 0.5f);
     PangolinViewer viewer;
 
-    LoopCloser bagLoopCloser(5.0f, 0.2f, 50);
-    bagLoopCloser.setLoopCooldown(100);
+    // 서브맵 기반 연속 루프 클로저 (GLIM식). 키프레임을 누적해 서브맵을 만들고,
+    // 현재 추정 위치 근방의 과거 서브맵과 GICP 정합 후 overlap 게이트를 통과하면 채택.
+    // 다운샘플(0.15m)은 가장 미세한 등록 voxel(0.5m)보다 촘촘해야 한다 — 그래야 각
+    // 0.5m voxel에 점이 6개 이상 모여 ICP의 공분산 게이트(point_count>=6)를 통과한다.
+    // (GLIM은 0.25m를 쓰지만 GLIM의 VGICP는 이 6점 제약이 없음)
+    // 작고 조밀한 서브맵 — 재방문 시 앵커가 가까이 겹쳐 깨끗한 small-dist 루프가 생긴다.
+    // (크면 띠가 길어져 앵커가 어긋나고, 부분겹침으로 드리프트만 재확인하는 가짜 루프가 됨)
+    SubmapBuilder submapBuilder(5, 0.15f);  // 키프레임 5개당 서브맵 1개, 0.15m 다운샘플
+    LoopCloser bagLoopCloser;
+    {
+        RegistrationParams rp;
+        rp.resolutions = {1.0f, 0.5f};  // coarse-to-fine 다해상도 GICP
+        // overlap이 진짜/가짜 루프를 깔끔히 가르는 주 판별자(진짜 0.45+, 가짜 0.13-).
+        // fitness는 본질적으로 더 빡빡(voxel 6점 게이트)해 진짜 루프를 죽이므로 floor만 둔다.
+        rp.minFitness = 0.25f;
+        rp.minOverlap = 0.4f;
+        rp.maxRmse = 0.5f;
+        bagLoopCloser.setRegistrationParams(rp);
+        bagLoopCloser.setSearchRadius(12.0f);   // 앵커가 실제 겹치는 진짜 루프만 (부분겹침 배제)
+        bagLoopCloser.setMinNodeGap(200);       // 인접 서브맵(~100 노드)은 루프에서 제외
+        bagLoopCloser.setMaxCandidates(8);
+    }
     bool poseGraphInited = false;
     Pose3D prevPose = {
         {1,0,0, 0,1,0, 0,0,1},
@@ -290,6 +311,12 @@ int main(int argc, char* argv[])
     int loopCount = 0;
     int slamExitCode = 0;
     std::vector<std::pair<int, int>> loopEdges;
+    // 디스플레이용 궤적 — 포즈그래프 추정치를 반영해 루프가 닫히면 화면에서 스냅된다.
+    // (front-end 내부 상태는 건드리지 않음)
+    std::vector<std::array<float, 3>> displayTraj;
+    // 루프 클로저 이벤트는 별도 파일로 — 프레임 로그 홍수에 묻히지 않게.
+    std::ofstream loopLog(outputDir + "loops.log");
+    loopLog << "# frame  from_anchor  to_anchor  fitness  overlap\n";
 
     std::vector<std::array<float, 3>> framePoints;
     std::vector<float> pointTimes;
@@ -355,6 +382,9 @@ int main(int argc, char* argv[])
 
             auto pos = currentPose.t;
 
+            // 디스플레이 궤적에 이번 노드의 포즈그래프 추정치를 추가
+            displayTraj.push_back(poseGraph.getPose(poseGraph.getCurrentId()).t);
+
             const auto& ds = bagOdom.getLastFrame();
             bagMap.addFrame(ds, bagOdom.getRotation(), pos);
 
@@ -362,44 +392,58 @@ int main(int argc, char* argv[])
             {
                 const int keyFrameId = poseGraph.getCurrentId();
                 bagMap.storeKeyFramePoints(keyFrameId, ds, currentPose);
-                float moveDist = 0.0f;
-                if (!bagOdom.getTrajectory().empty())
-                {
-                    const auto& traj = bagOdom.getTrajectory();
-                    int n = (int)traj.size();
-                    int lookback = std::min(n - 1, 10);
-                    if (lookback > 0)
-                    {
-                        float dx = traj[n-1][0] - traj[n-1-lookback][0];
-                        float dy = traj[n-1][1] - traj[n-1-lookback][1];
-                        moveDist = std::sqrt(dx*dx + dy*dy);
-                    }
-                }
 
-                if (useLoopClosure && moveDist > 0.05f && bagLoopCloser.detect(keyFrameId, pos, currentPose.R, ds))
+                // 키프레임을 서브맵에 누적. 서브맵이 완성되면 루프 클로저 시도.
+                if (useLoopClosure &&
+                    submapBuilder.addKeyframe(keyFrameId, currentPose, ds))
                 {
-                    loopEdges.push_back({bagLoopCloser.getLastLoopFromId(), bagLoopCloser.getLastLoopToId()});
-                    // 맵 재구성은 여기서 하지 않음 — 중간 추정치로 전체를 다시 그리면
-                    // 작은 보정 오차가 먼 거리 점에 크게 증폭됨. 트래젝토리만 갱신하고
-                    // 맵 재구성은 모든 프레임 처리가 끝난 뒤 한 번만 수행한다.
-                    const auto optimizedPoses = poseGraph.addLoopClosure(
-                        bagLoopCloser.getLastLoopFromId(),
-                        bagLoopCloser.getLastLoopToId(),
-                        bagLoopCloser.getLastLoopRelativePose());
-                    const auto optimizedTrajectory = poseTrajectory(optimizedPoses);
-                    bagOdom.setTrajectory(optimizedTrajectory);
-                    if (!optimizedPoses.empty())
-                        bagOdom.setPosition(optimizedPoses.back().t);
-                    ++loopCount;
-                    std::cout << "[SLAM] 루프 클로저 보정! (누적 " << loopCount << "회)" << std::endl;
-                }
-                else
-                {
-                    bagLoopCloser.addKeyFrame(keyFrameId, pos, currentPose.R, ds);
+                    Submap completed = submapBuilder.takeSubmap();
+                    const Pose3D anchorNow = poseGraph.getPose(completed.anchorId);
+                    auto loops = bagLoopCloser.add(
+                        completed, anchorNow,
+                        [&](int id){ return poseGraph.getPose(id); },
+                        &loopLog);
+
+                    for (const auto& lp : loops)
+                    {
+                        loopEdges.push_back({lp.fromId, lp.toId});
+                        // 보정은 포즈그래프에만 누적한다. front-end(Odometry)의 위치/회전/로컬맵은
+                        // 중간에 건드리지 않는다 — 위치만 끌어당기면 다음 스캔이 옛 프레임 로컬맵과
+                        // 매칭돼 깨진다(teleportation 원인). odometry delta는 프레임 불변이라
+                        // 포즈그래프 factor에는 문제없고, 궤적/맵은 종료 후 rebuildFromPoses로 일괄 보정.
+                        // confidence = overlap×fitness 로 정합 신뢰도를 노이즈에 반영 (GLIM Hessian 근사).
+                        float confidence = lp.overlap * lp.fitness;
+                        poseGraph.addLoopClosure(lp.fromId, lp.toId, lp.relativePose, confidence);
+                        ++loopCount;
+                        std::cout << "[SLAM] 루프 클로저 보정! 앵커 "
+                                  << lp.fromId << "<->" << lp.toId
+                                  << " (fitness=" << lp.fitness << ", overlap=" << lp.overlap
+                                  << ", 누적 " << loopCount << "회)" << std::endl;
+                        loopLog << frameIdx << "  " << lp.fromId << "  " << lp.toId
+                                << "  " << lp.fitness << "  " << lp.overlap << std::endl;
+                    }
+
+                    // 루프가 채택됐으면 디스플레이 궤적/맵을 최적화 결과로 즉시 갱신
+                    // → Pangolin 화면에서 루프가 닫히는 순간이 보인다 (GLIM식).
+                    // bagMap은 디스플레이/출력 전용이라 front-end 매칭(_localMap)과 무관.
+                    if (!loops.empty())
+                    {
+                        const auto optimized = poseGraph.getAllPoses();
+                        displayTraj = poseTrajectory(optimized);
+                        bagMap.rebuildFromPoses(optimized);
+
+                        // 루프 연결선 갱신 (어느 앵커끼리 묶였는지 시각화)
+                        std::vector<std::pair<std::array<float,3>, std::array<float,3>>> segs;
+                        for (const auto& e : loopEdges)
+                            segs.push_back({poseGraph.getPose(e.first).t,
+                                            poseGraph.getPose(e.second).t});
+                        viewer.setLoopEdges(segs);
+                    }
                 }
             }
 
-            viewer.update(bagMap.getMap(), bagOdom.getTrajectory(), bagOdom.getRotation(), bagOdom.getPosition(), frameIdx, 0.0f);
+            const Pose3D curGraphPose = poseGraph.getPose(poseGraph.getCurrentId());
+            viewer.update(bagMap.getMap(), displayTraj, curGraphPose.R, curGraphPose.t, frameIdx, 0.0f);
 
             std::cout << "[SLAM] 프레임 " << frameIdx
                       << " | 점 개수: " << framePoints.size()
@@ -420,6 +464,9 @@ int main(int argc, char* argv[])
             const auto finalPoses = poseGraph.getAllPoses();
             bagMap.rebuildFromPoses(finalPoses);
             bagOdom.setTrajectory(poseTrajectory(finalPoses));
+            displayTraj = poseTrajectory(finalPoses);  // 최종 디스플레이 갱신
+            const Pose3D last = finalPoses.back();
+            viewer.update(bagMap.getMap(), displayTraj, last.R, last.t, frameIdx, 0.0f);
         }
 
         bagMap.saveToPly(outputDir + "slam_map.ply");
@@ -435,7 +482,9 @@ int main(int argc, char* argv[])
                   << bagOdom.getPosition()[1] << ", "
                   << bagOdom.getPosition()[2] << ")" << std::endl;
 
-        viewer.requestStop();
+        // SLAM 처리는 끝났지만 창은 닫지 않는다 — 사용자가 결과를 확인하고
+        // 직접 창을 닫을 때까지 뷰어를 유지한다.
+        std::cout << "\n[SLAM] 처리 완료. 결과를 확인한 뒤 창을 닫으면 종료됩니다." << std::endl;
     });
 
     viewer.runBlocking();

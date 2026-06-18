@@ -12,6 +12,7 @@
 #include <gtsam/geometry/Unit3.h>
 #include <gtsam/linear/NoiseModel.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <cmath>
 
@@ -149,15 +150,27 @@ Pose3D PoseGraph::addOdometry(const Pose3D& deltaPose,
     return getPose(_currentId);
 }
 
-std::vector<Pose3D> PoseGraph::addLoopClosure(int fromId, int toId, const Pose3D& relativePose)
+std::vector<Pose3D> PoseGraph::addLoopClosure(int fromId, int toId, const Pose3D& relativePose,
+                                              float confidence)
 {
     if (fromId < 0 || toId < 0 || fromId > _currentId || toId > _currentId)
         return getAllPoses();
 
+    // 게이트(fitness/overlap)를 이미 통과한 루프는 신뢰할 만하므로 타이트한 base를 쓴다.
+    // sigma = base / confidence: 신뢰도가 높을수록 더 강하게 그래프를 당긴다 (GLIM Hessian 근사).
+    // base가 너무 크면(이전 0.1rad/0.2m) 누적 drift를 못 이겨 두 바퀴가 안 붙는다.
+    // Huber robust로 감싸 잘못된 루프 하나가 그래프를 폭주시키는 것을 막는다.
+    float c = std::min(std::max(confidence, 0.1f), 1.0f);
+    double sr = 0.02 / c;  // 회전 sigma (rad) — base 1.15°
+    double st = 0.05 / c;  // 이동 sigma (m)  — base 5cm
+    auto loopNoise = gtsam::noiseModel::Robust::Create(
+        gtsam::noiseModel::mEstimator::Huber::Create(1.0),
+        diagonalNoise(sr, sr, sr, st, st, st));
+
     gtsam::NonlinearFactorGraph graph;
     gtsam::Values initial;
     graph.add(gtsam::BetweenFactor<gtsam::Pose3>(
-        key(fromId), key(toId), toGtsamPose(relativePose), _impl->loopNoise));
+        key(fromId), key(toId), toGtsamPose(relativePose), loopNoise));
 
     _impl->isam.update(graph, initial);
     _impl->isam.update();

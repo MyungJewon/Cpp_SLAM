@@ -66,6 +66,13 @@ void PangolinViewer::update(const std::vector<std::array<float,3>>& mapPoints,
     _dirty = true;
 }
 
+void PangolinViewer::setLoopEdges(
+    const std::vector<std::pair<std::array<float,3>, std::array<float,3>>>& edges)
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+    _loopEdges = edges;
+}
+
 void PangolinViewer::runBlocking()
 {
     pangolin::CreateWindowAndBind("SLAM Viewer", 1280, 720);
@@ -97,6 +104,7 @@ void PangolinViewer::runBlocking()
 
     std::vector<std::array<float,3>> mapPoints;
     std::vector<std::array<float,3>> trajectory;
+    std::vector<std::pair<std::array<float,3>, std::array<float,3>>> loopEdges;
     Matrix3x3 rot = {1.0f, 0.0f, 0.0f,
                      0.0f, 1.0f, 0.0f,
                      0.0f, 0.0f, 1.0f};
@@ -110,6 +118,7 @@ void PangolinViewer::runBlocking()
             std::lock_guard<std::mutex> lock(_mutex);
             mapPoints = _mapPoints;
             trajectory = _trajectory;
+            loopEdges = _loopEdges;
             rot = _rotation;
             pos = _position;
             frameIdx = _frameIdx;
@@ -156,6 +165,17 @@ void PangolinViewer::runBlocking()
                 const auto& p = trajectory[i];
                 glVertex3f(p[0], p[1], p[2]);
             }
+            glEnd();
+        }
+
+        // 루프 클로저 연결선 — 어느 지점끼리 묶였는지 노란 선으로 표시
+        if (!loopEdges.empty())
+        {
+            glLineWidth(2.0f);
+            glColor3f(1.0f, 1.0f, 0.0f);
+            glBegin(GL_LINES);
+            for (const auto& e : loopEdges)
+                drawLine(e.first, e.second);
             glEnd();
         }
 

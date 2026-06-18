@@ -16,6 +16,8 @@ add_executable(slam
     src/ScanContext.cpp
     src/VoxelGrid.cpp
     src/Odometry.cpp
+    src/SubmapRegistration.cpp
+    src/SubmapBuilder.cpp
     src/LoopCloser.cpp
     src/MapBuilder.cpp
     src/BagParser.cpp

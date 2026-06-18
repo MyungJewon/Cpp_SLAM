@@ -696,6 +696,12 @@ bool BagParser::parseLivoxCustomMsg(const std::vector<uint8_t>& data,
     readU8();                           // lidar_id
     readU8(); readU8(); readU8();       // rsvd[3]
 
+    // ROS1 가변길이 배열(CustomPoint[] points)은 앞에 uint32 배열길이 접두사가 붙는다.
+    // 이를 건너뛰지 않으면 4바이트 밀려 x=0으로 깨지고 z가 사라져 점군이 평면/선으로 납작해진다.
+    uint32_t arrayLen = readU32();      // points 배열 길이 (= point_num)
+    if (arrayLen != 0 && arrayLen != pointNum)
+        pointNum = arrayLen;            // 안전: 배열 접두사를 우선 사용
+
     if (pointNum == 0 || offset >= data.size()) return false;
 
     points.clear();

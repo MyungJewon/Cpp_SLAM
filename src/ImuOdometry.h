@@ -16,6 +16,11 @@ public:
     ImuOdometry(const std::array<double,3>& gyroBias, double gravityMagnitude = 9.81);
     ~ImuOdometry();
 
+    // nav(월드) 좌표계에서의 중력 벡터를 설정 (m/s^2, 보통 -9.81·up).
+    // 정지 구간 가속도계로 측정한 중력 방향을 넣으면 preintegration이 중력을
+    // 올바르게 제거해 속도 발산을 막는다. init() 호출 전에 설정해야 한다.
+    void setNavGravity(const std::array<float,3>& gNav);
+
     // 첫 프레임의 pose로 초기화 (velocity=0, 추정 바이어스로 시작)
     void init(const Matrix3x3& R0, const std::array<float,3>& t0);
 

@@ -12,9 +12,11 @@
 #include <gtsam/slam/BetweenFactor.h>
 #include <gtsam/slam/PriorFactor.h>
 #include <gtsam/linear/NoiseModel.h>
+#include <gtsam/linear/linearExceptions.h>
 
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <memory>
 
 namespace
@@ -97,24 +99,23 @@ struct ImuOdometry::Impl
         , initialBias(gtsam::Vector3(0.0, 0.0, 0.0),
                       gtsam::Vector3(gyroBias[0], gyroBias[1], gyroBias[2]))
     {
-        const double gyroNoiseSigma = 1e-3;
-        const double accelNoiseSigma = 1e-2;
-        const double gyroBiasRwSigma = 1e-5;
-        // 가속도 바이어스는 캘리브레이션을 안 해서 0으로 시작하는데,
-        // random walk가 너무 작으면(이전 1e-4) factor graph가 실측값을 보고도
-        // 바이어스를 거의 못 움직여서 z가 그대로 적분 오차로 누적됨.
-        // 충분히 키워서 그래프가 실제로 바이어스를 추정/교정하게 함.
-        const double accelBiasRwSigma = 3e-3;
-        const double integrationSigma = 1e-8;
+        // IMU 노이즈 공분산은 FAST-LIVO2 avia.yaml 값을 따른다.
+        // 핵심: 가속도계를 과신하면(이전 cov 1e-4) 중력/bias 오차가 속도를 끌어당겨
+        // 발산한다. FAST-LIVO2처럼 크게(loose) 잡아 LiDAR를 더 신뢰하게 한다.
+        const double accCov     = 0.5;     // FAST-LIVO2 acc_cov
+        const double gyrCov     = 0.3;     // FAST-LIVO2 gyr_cov
+        const double bAccCov    = 1e-4;    // FAST-LIVO2 b_acc_cov
+        const double bGyrCov    = 1e-4;    // FAST-LIVO2 b_gyr_cov
+        const double integrationSigma = 1e-4;
 
         preintParams->setGyroscopeCovariance(
-            gtsam::Matrix3::Identity() * gyroNoiseSigma * gyroNoiseSigma);
+            gtsam::Matrix3::Identity() * gyrCov);
         preintParams->setAccelerometerCovariance(
-            gtsam::Matrix3::Identity() * accelNoiseSigma * accelNoiseSigma);
+            gtsam::Matrix3::Identity() * accCov);
         preintParams->setBiasOmegaCovariance(
-            gtsam::Matrix3::Identity() * gyroBiasRwSigma * gyroBiasRwSigma);
+            gtsam::Matrix3::Identity() * bGyrCov);
         preintParams->setBiasAccCovariance(
-            gtsam::Matrix3::Identity() * accelBiasRwSigma * accelBiasRwSigma);
+            gtsam::Matrix3::Identity() * bAccCov);
         preintParams->setIntegrationCovariance(
             gtsam::Matrix3::Identity() * integrationSigma * integrationSigma);
     }
@@ -151,6 +152,28 @@ struct ImuOdometry::Impl
             preint = std::make_unique<gtsam::PreintegratedCombinedMeasurements>(
                 preintParams, currentBias());
     }
+
+    // 발산/특이행렬에서 자가복구: 그래프를 주어진 pose에서 새로 시작한다.
+    // 누적된 IMU 상태를 버리고 LiDAR pose를 신뢰해 다시 출발 (크래시 방지).
+    void reinitAt(const gtsam::Pose3& pose)
+    {
+        isam = gtsam::ISAM2();
+        currentId = 0;
+        lastTimestamp = -1.0;
+        preint.reset();
+
+        gtsam::NonlinearFactorGraph graph;
+        gtsam::Values initial;
+        const gtsam::Vector3 zeroVel(0.0, 0.0, 0.0);
+        graph.add(gtsam::PriorFactor<gtsam::Pose3>(xKey(0), pose, posePriorNoise));
+        graph.add(gtsam::PriorFactor<gtsam::Vector3>(vKey(0), zeroVel, velocityPriorNoise));
+        graph.add(gtsam::PriorFactor<gtsam::imuBias::ConstantBias>(bKey(0), initialBias, biasPriorNoise));
+        initial.insert(xKey(0), pose);
+        initial.insert(vKey(0), zeroVel);
+        initial.insert(bKey(0), initialBias);
+        isam.update(graph, initial);
+        currentEstimate = isam.calculateEstimate();
+    }
 };
 
 ImuOdometry::ImuOdometry(const std::array<double,3>& gyroBias, double gravityMagnitude)
@@ -161,6 +184,12 @@ ImuOdometry::ImuOdometry(const std::array<double,3>& gyroBias, double gravityMag
 ImuOdometry::~ImuOdometry()
 {
     delete _impl;
+}
+
+void ImuOdometry::setNavGravity(const std::array<float,3>& gNav)
+{
+    _impl->preintParams->n_gravity =
+        gtsam::Vector3(gNav[0], gNav[1], gNav[2]);
 }
 
 void ImuOdometry::init(const Matrix3x3& R0, const std::array<float,3>& t0)
@@ -257,6 +286,20 @@ ImuOdometry::Prediction ImuOdometry::update(const Matrix3x3& icpR,
             bKey(prevId), bKey(newId),
             *_impl->preint));
     }
+    else
+    {
+        // IMU 공백 구간(샘플 없음/큰 dt): CombinedImuFactor가 없으면 v(new)/b(new)가
+        // 묶이지 않아 underconstrained → GTSAM IndeterminantLinearSystem 크래시.
+        // bias는 random walk, velocity는 등속 가정으로 직전 노드에 묶어 그래프를 유지한다.
+        graph.add(gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>(
+            bKey(prevId), bKey(newId),
+            gtsam::imuBias::ConstantBias(),
+            diagonalNoise(1e-2, 1e-2, 1e-2, 1e-4, 1e-4, 1e-4)));  // [acc(3), gyro(3)]
+        graph.add(gtsam::BetweenFactor<gtsam::Vector3>(
+            vKey(prevId), vKey(newId),
+            gtsam::Vector3(0.0, 0.0, 0.0),
+            gtsam::noiseModel::Isotropic::Sigma(3, 2.0)));  // 등속 가정 (loose)
+    }
 
     const gtsam::Pose3 absoluteIcpPose = toGtsamPose(icpR, icpT);
     const gtsam::Pose3 relativePose = previousPose.between(absoluteIcpPose);
@@ -281,9 +324,20 @@ ImuOdometry::Prediction ImuOdometry::update(const Matrix3x3& icpR,
     initial.insert(vKey(newId), initialVelocity);
     initial.insert(bKey(newId), previousBias);
 
-    _impl->isam.update(graph, initial);
-    _impl->currentEstimate = _impl->isam.calculateEstimate();
-    _impl->currentId = newId;
+    try
+    {
+        _impl->isam.update(graph, initial);
+        _impl->currentEstimate = _impl->isam.calculateEstimate();
+        _impl->currentId = newId;
+    }
+    catch (const gtsam::IndeterminantLinearSystemException& e)
+    {
+        // IMU/LiDAR 충돌로 속도 등이 발산 → 특이행렬. 그래프를 LiDAR pose에서
+        // 새로 시작해 자가복구하고 이번 프레임은 LiDAR 추정을 그대로 사용.
+        std::cerr << "[ImuOdometry] 발산 감지 — LiDAR pose로 그래프 재시작" << std::endl;
+        _impl->reinitAt(absoluteIcpPose);
+        return makePrediction(absoluteIcpPose, gtsam::Vector3(0.0, 0.0, 0.0));
+    }
 
     return makePrediction(
         _impl->currentEstimate.at<gtsam::Pose3>(xKey(newId)),

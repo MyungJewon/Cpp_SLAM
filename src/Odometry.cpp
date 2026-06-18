@@ -140,27 +140,14 @@ void Odometry::addFrame(const std::vector<std::array<float, 3>>& rawPoints,
         double scanDuration = (double)*std::max_element(pointTimes->begin(), pointTimes->end());
         Matrix3x3 REnd = _imu->getRotationAt(scanDuration);
         Matrix3x3 REndInv = transposeMat(REnd);
-        std::array<float, 3> bodyVelocity = {0.0f, 0.0f, 0.0f};
-
-        if (_imuOdom)
-        {
-            auto pred = _imuOdom->predict();
-            bodyVelocity = multiplyVec(transposeMat(pred.R), pred.velocity);
-        }
-
         for (size_t i = 0; i < rawPoints.size(); ++i)
         {
             Matrix3x3 RAtTi = _imu->getRotationAt((double)(*pointTimes)[i]);
             // 점이 찍힌 시점의 자세를 스캔 종료 시점 자세로 맞춰 회전 왜곡을 줄입니다.
+            // 회전 deskew는 자이로 기반이라 신뢰 가능. translational deskew는 IMU velocity가
+            // 발산하면 점을 수 미터씩 밀어 점군을 망가뜨리므로(정합 fitness 붕괴) 사용하지 않는다.
             Matrix3x3 RRel = multiplyMat(REndInv, RAtTi);
             deskewed[i] = multiplyVec(RRel, rawPoints[i]);
-            if (_imuOdom)
-            {
-                const float dtToScanEnd = static_cast<float>(scanDuration - (double)(*pointTimes)[i]);
-                deskewed[i][0] -= bodyVelocity[0] * dtToScanEnd;
-                deskewed[i][1] -= bodyVelocity[1] * dtToScanEnd;
-                deskewed[i][2] -= bodyVelocity[2] * dtToScanEnd;
-            }
         }
         filterInput = &deskewed;
     }

@@ -347,15 +347,18 @@ int main(int argc, char* argv[])
                 imuCalibrationLogged = true;
             }
 
-            if (useImuOdom && !imuOdom && imu.isCalibrated() && firstFrameDone)
+            // --imu: IMU 캘리브레이션(중력/자이로바이어스)이 끝나야 LIO 그래프를 시작한다.
+            // 캘리브 전 프레임은 건너뛴다 (보통 데이터 시작부 정지 구간).
+            if (useImuOdom && !imu.isCalibrated())
             {
-                imuOdom = std::make_unique<ImuOdometry>(imu.getGyroBias(), 9.81);
-                imuOdom->init(bagOdom.getRotation(), bagOdom.getPosition());
-                bagOdom.setImuOdometry(imuOdom.get());
+                bag.clearImuBuffer();
+                continue;
             }
 
-            if (imuOdom)
-                imuOdom->integrateImu(imuSamples);
+            // 그래프가 활성화돼 있으면 직전~현재 사이 IMU 샘플을 preintegration에 누적
+            // (그래프 init 전에는 no-op)
+            if (useImuOdom)
+                poseGraph.integrateImu(imuSamples);
 
             bag.clearImuBuffer();
             bagOdom.addFrame(framePoints, &pointTimes);
@@ -365,18 +368,26 @@ int main(int argc, char* argv[])
 
             if (!poseGraphInited)
             {
+                // IMU 모드: enableImu는 반드시 init 전에 (init이 V0/B0 노드를 생성).
+                if (useImuOdom)
+                {
+                    std::array<float, 3> gUp0;
+                    std::array<float, 3> navG = {0.0f, 0.0f, -9.81f};
+                    if (imu.getGravityUp(gUp0))
+                        navG = {-9.81f*gUp0[0], -9.81f*gUp0[1], -9.81f*gUp0[2]};
+                    poseGraph.enableImu(imu.getGyroBias(), 9.81, navG);
+                    std::cout << "[SLAM] LIO 그래프 시작 (IMU 타이트커플링, nav중력 "
+                              << navG[0] << "," << navG[1] << "," << navG[2] << ")" << std::endl;
+                }
                 poseGraph.init(currentPose);
                 poseGraphInited = true;
             }
             else
             {
                 Pose3D delta = relativePose(prevPose, currentPose);
-                // B1 자세 factor: 가속도계 중력이 이 데이터에서 신뢰 불가로 판명되어
-                // 현재 비활성. 신뢰 가능한 IMU/캘리브레이션 확보 후 재활성.
-                const bool useAttitudeFactor = false;
-                std::array<float, 3> gUp;
-                bool hasG = useAttitudeFactor && bagOdom.getLastGravityUp(gUp);
-                poseGraph.addOdometry(delta, hasG ? &gUp : nullptr);
+                // GICP delta는 LiDAR 측정 BetweenFactor로, IMU는 CombinedImuFactor로
+                // 같은 그래프에서 동시 최적화 (addOdometry 내부에서 처리).
+                poseGraph.addOdometry(delta);
             }
             prevPose = currentPose;
 

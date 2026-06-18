@@ -27,7 +27,7 @@ ROS1 Bag
                                                 (신뢰도 가중 노이즈)
 
 옵션:
-  --imu    ImuOdometry 타이트커플링 실험 경로 활성화 (미완성, 크래시 가능)
+  --imu    IMU 타이트커플링(LIO) 실험 경로 활성화 (실험적, 아직 실사용 부적합)
   기본값   타이트커플링 OFF (IMU는 회전 deskew 전용)
 
 PoseGraph 최적화 결과 ──→ MapBuilder ──→ output/slam_map.ply
@@ -49,14 +49,14 @@ PoseGraph 최적화 결과 ──→ MapBuilder ──→ output/slam_map.ply
 | `KDTree` | 3D KD-Tree. ICP 대응점 탐색에 사용 |
 | `ICP` | Voxel-GICP. per-voxel Mahalanobis 가중치, point-to-plane fallback |
 | `IMUPreintegrator` | IMU 적분 (Rodrigues 공식). 회전 deskew와 gravity 측정 저장에 사용 |
-| `ImuOdometry` | GTSAM IMU preintegration 타이트커플링 실험 경로. **미완성**, `--imu`에서만 사용 |
+| `ImuOdometry` | (레거시) 별도 그래프 IMU 융합. pose override 방식이 점군을 망가뜨려 폐기, 현재 미사용 |
 | `Odometry` | Scan-to-Map 포즈 추정. Constant velocity 예측, sliding window 로컬 맵 |
 | `PoseMath` | Pose3D 변환 수학 (compose/invert/relative). 실시간·오프라인 공용 |
 | `Submap` | 점군 덩어리 + 앵커 pose + AABB. 키프레임 누적 결과 / 향후 PLY 1장 |
 | `SubmapBuilder` | 키프레임을 앵커 로컬 좌표계로 누적해 Submap 생성 |
 | `SubmapRegistration` | **재사용 정합 코어**. 두 Submap을 coarse-to-fine GICP로 정합 (실시간 루프 + 향후 PLY 병합 공용) |
 | `LoopCloser` | GLIM식 서브맵 기반 연속 루프 클로저. 위치 후보 → AABB → 정합 → overlap 게이트 |
-| `PoseGraph` | GTSAM iSAM2 pose graph. odometry + 신뢰도 가중 루프 BetweenFactor (attitude factor는 비활성) |
+| `PoseGraph` | GTSAM iSAM2 pose graph. odometry + 신뢰도 가중 루프 BetweenFactor. `--imu` 시 X/V/B 노드 + CombinedImuFactor 통합(LIO-SAM식, 실험적) |
 | `MapBuilder` | 전역 점군 누적, keyframe 저장, PLY 저장 |
 | `PangolinViewer` | 실시간 3D 시각화 + 루프 클로저 스냅/연결선, 종료 후 창 유지 |
 
@@ -139,11 +139,25 @@ Pangolin 뷰어는 매 프레임 PoseGraph 추정 궤적을 그려 루프가 닫
 - **기본 실행은 IMU를 위치 추정에 사용하지 않습니다.** IMU 샘플은 `IMUPreintegrator`로
   들어가 **회전 deskew와 gravity 측정 보관에만** 쓰입니다. 실제 포즈는 순수 LiDAR GICP로 추정.
 - `Odometry`/`ICP`의 gravity prior 훅(`_gravityScale = 0.0f`), `PoseGraph` attitude factor는 비활성.
-  (freeway 데이터에서 가속도계 중력이 z 드리프트를 악화시킴이 확인됨)
-- `--imu` 타이트커플링(`ImuOdometry`) 경로는 **미완성**입니다. IMU preintegration 공백 구간에서
-  velocity/bias 노드가 underconstrained가 되어 GTSAM `IndeterminantLinearSystem` 크래시가 발생할 수 있습니다.
-- 좁은 FOV Livox(예: hku_main_building)는 순수 LiDAR로 pitch/z 드리프트가 크며,
-  이 격차를 메우려면 IMU 타이트커플링 완성이 필요합니다 (다음 작업).
+
+#### `--imu` LIO 타이트커플링 (실험적, 아직 실사용 부적합)
+
+`--imu`를 주면 IMU를 **메인 `PoseGraph`에 직접 통합**합니다 (LIO-SAM식 단일 그래프):
+X/V/B 노드 + `CombinedImuFactor`가 GICP odometry(BetweenFactor) + 루프 factor와 같은
+iSAM2 그래프에서 동시 최적화됩니다. 시작 정지 구간 가속도계로 nav 중력 방향을 설정하고,
+IMU 노이즈는 FAST-LIVO2 avia 값(loose)을 사용합니다.
+
+진행 경과:
+- 초기 별도 그래프(`ImuOdometry`)가 pose를 override하던 방식은 점군을 망가뜨려(정합 fitness 붕괴) **폐기**.
+- 단일 그래프로 전환 후: 발산 크래시 해소(try/catch + 공백구간 v/b 구속), 점군 정합 정상화,
+  일부 데이터에서 z 드리프트 감소(예: data_2 z 4m→1.5m) 확인.
+
+**그러나 여전히 누적 드리프트가 커서 실사용 수준은 아닙니다.** 강한 LiDAR(360°) 데이터에서는
+IMU가 루프 검출을 다소 떨어뜨리고, 약한 FOV(Livox)에서는 드리프트 억제가 충분치 않습니다.
+완성하려면 LiDAR 신뢰도(fitness) 기반 적응 가중, IMU-LiDAR 시간 동기/정밀 튜닝, 초기화 개선이 필요합니다.
+
+- 좁은 FOV Livox(예: hku_main_building)는 순수 LiDAR만으로는 pitch/z 드리프트가 크며,
+  이 격차를 제대로 메우는 것이 향후 핵심 과제입니다.
 
 ---
 
@@ -260,16 +274,19 @@ build/slam data.bag /velodyne_points /imu/data --imu
 - [x] **GLIM식 서브맵 루프 클로저** (PoseMath/Submap/SubmapBuilder/SubmapRegistration/LoopCloser)
   - coarse-to-fine GICP, overlap 주 판별, 신뢰도 가중 루프 노이즈, 연속 폐합
 - [x] PoseGraph (GTSAM iSAM2) odometry + 루프 BetweenFactor 통합
+- [~] LIO 단일 그래프 (`--imu`, X/V/B + CombinedImuFactor) — **실험적, 크래시 해소·정합 정상화는 됐으나
+      누적 드리프트가 커 아직 실사용 부적합**
 
 ### 진행 중 / 향후 과제
-- [ ] **IMU 타이트커플링 완성** (`--imu` ImuOdometry 크래시 수정 + 튜닝) — 좁은 FOV/드리프트 핵심
-  - 현재 IMU preintegration 공백 구간에서 velocity/bias underconstrained → GTSAM 크래시
-- [ ] Z / pitch 드리프트 보정 (IMU 또는 신뢰 가능한 중력 정렬)
+- [ ] **`--imu` LIO 드리프트 안정화** (현재 최우선) — 누적 드리프트가 커 실사용 불가
+  - LiDAR fitness 기반 적응 가중 (LiDAR 강할 때 IMU 비켜주고 약할 때만 받치기)
+  - IMU-LiDAR 시간 동기, 초기화/바이어스 정밀 튜닝
+- [ ] Z / pitch 드리프트 보정 (순수 LiDAR 한계 — 위 LIO로 해결 목표)
 - [ ] BagParser 압축 chunk(lz4/bz2) 지원 (현재 none만)
 - [ ] 오프라인 PLY 병합 도구 (MapMerger — SubmapRegistration 재사용)
 
-> 참고: front-end gravity prior와 PoseGraph attitude factor는 구현 훅은 있으나 현재 기본 비활성입니다.
-> IMU 타이트커플링은 `--imu` 옵션으로 분리돼 있으며 아직 미완성입니다.
+> 참고: 기본 권장 구성은 **순수 LiDAR + 루프 클로저**(IMU off)입니다 — 360° 라이다에서 검증됨.
+> `--imu` LIO 경로는 실험적이며 드리프트가 커 아직 기본값이 아닙니다.
 
 ---
 

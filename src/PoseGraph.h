@@ -2,6 +2,7 @@
 #include <vector>
 #include <array>
 #include "ICP.h"  // for Matrix3x3
+#include "IMUPreintegrator.h"  // for ImuSample
 
 // Pose = rotation (Matrix3x3 row-major) + translation
 struct Pose3D {
@@ -15,8 +16,21 @@ public:
     ~PoseGraph();
 
     void init(const Pose3D& firstPose);
-    // deltaPose: 직전 노드 대비 상대 변환.
+
+    // IMU 타이트커플링 활성화 (init 전에 호출). LIO-SAM식 단일 그래프로
+    // X,V,B 노드 + CombinedImuFactor를 GICP odometry/루프와 같은 그래프에서 최적화한다.
+    //   gyroBias    : 정지 캘리브레이션 자이로 바이어스
+    //   gravityMag  : 중력 크기 (보통 9.81)
+    //   navGravity  : nav(월드) 좌표 중력 벡터 (보통 -9.81·up). 시작 정지 가속도계로 측정.
+    void enableImu(const std::array<double, 3>& gyroBias, double gravityMag,
+                   const std::array<float, 3>& navGravity);
+
+    // 직전 노드~현재 프레임 사이 IMU 샘플을 preintegration에 누적 (addOdometry 전에 호출)
+    void integrateImu(const std::vector<ImuSample>& samples);
+
+    // deltaPose: 직전 노드 대비 상대 변환 (GICP scan-to-map 측정값).
     // gravityBodyUp: 이 노드의 IMU 중력(바디 좌표). nullptr이면 자세 factor 미추가.
+    // IMU가 활성화되어 있으면 누적된 preintegration으로 CombinedImuFactor도 함께 추가한다.
     Pose3D addOdometry(const Pose3D& deltaPose,
                        const std::array<float, 3>* gravityBodyUp = nullptr);
     // confidence: 정합 신뢰도(0~1, 보통 overlap×fitness). 높을수록 루프를 강하게 구속한다.

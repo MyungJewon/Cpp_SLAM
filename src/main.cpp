@@ -15,6 +15,7 @@
 #include "LoopCloser.h"
 #include "SubmapBuilder.h"
 #include "MapBuilder.h"
+#include "SessionIO.h"
 #include "Odometry.h"
 #include "PangolinViewer.h"
 #include "PoseGraph.h"
@@ -233,6 +234,7 @@ int main(int argc, char* argv[])
 
     bool useLoopClosure = true;
     bool useImuOdom = false;
+    std::string sessionDir;  // --save-session <dir>: 멀티세션 병합용 세션 저장
     std::vector<std::string> posArgs;
     for (int i = 1; i < argc; ++i)
     {
@@ -243,6 +245,8 @@ int main(int argc, char* argv[])
             useImuOdom = true;
         else if (a == "--no-imu" || a == "-nimu")
             useImuOdom = false;
+        else if (a == "--save-session" && i + 1 < argc)
+            sessionDir = argv[++i];
         else
             posArgs.push_back(a);
     }
@@ -266,7 +270,7 @@ int main(int argc, char* argv[])
     std::cout << "\n--- Bag Parser + SLAM ---" << std::endl;
 
     BagParser        bag(bagPath, pointsTopic, imuTopic);
-    Odometry         bagOdom(0.5f);
+    Odometry         bagOdom(0.2f);
     MapBuilder       bagMap(0.3f, 10);
     PoseGraph        poseGraph;
     IMUPreintegrator imu;
@@ -404,8 +408,9 @@ int main(int argc, char* argv[])
                 const int keyFrameId = poseGraph.getCurrentId();
                 bagMap.storeKeyFramePoints(keyFrameId, ds, currentPose);
 
-                // 키프레임을 서브맵에 누적. 서브맵이 완성되면 루프 클로저 시도.
-                if (useLoopClosure &&
+                // 키프레임을 서브맵에 누적. 서브맵 완성 시 LoopCloser에 등록(세션 저장용)
+                // 하고, 루프 클로저가 켜져 있으면 보정도 적용한다.
+                if ((useLoopClosure || !sessionDir.empty()) &&
                     submapBuilder.addKeyframe(keyFrameId, currentPose, ds))
                 {
                     Submap completed = submapBuilder.takeSubmap();
@@ -413,8 +418,9 @@ int main(int argc, char* argv[])
                     auto loops = bagLoopCloser.add(
                         completed, anchorNow,
                         [&](int id){ return poseGraph.getPose(id); },
-                        &loopLog);
+                        useLoopClosure ? &loopLog : nullptr);
 
+                    if (useLoopClosure)
                     for (const auto& lp : loops)
                     {
                         loopEdges.push_back({lp.fromId, lp.toId});
@@ -437,7 +443,7 @@ int main(int argc, char* argv[])
                     // 루프가 채택됐으면 디스플레이 궤적/맵을 최적화 결과로 즉시 갱신
                     // → Pangolin 화면에서 루프가 닫히는 순간이 보인다 (GLIM식).
                     // bagMap은 디스플레이/출력 전용이라 front-end 매칭(_localMap)과 무관.
-                    if (!loops.empty())
+                    if (useLoopClosure && !loops.empty())
                     {
                         const auto optimized = poseGraph.getAllPoses();
                         displayTraj = poseTrajectory(optimized);
@@ -478,6 +484,24 @@ int main(int argc, char* argv[])
             displayTraj = poseTrajectory(finalPoses);  // 최종 디스플레이 갱신
             const Pose3D last = finalPoses.back();
             viewer.update(bagMap.getMap(), displayTraj, last.R, last.t, frameIdx, 0.0f);
+
+            // 멀티세션 병합용 세션 저장: 서브맵 점(anchor-local) + 보정된 anchor 포즈.
+            if (!sessionDir.empty())
+            {
+                Session sess;
+                sess.name = "session";
+                const auto& subs = bagLoopCloser.submaps();
+                for (const auto& sm : subs)
+                {
+                    Submap m = sm;
+                    if (m.anchorId >= 0 && m.anchorId < (int)finalPoses.size())
+                        m.refPose = finalPoses[m.anchorId];  // 보정된 anchor 포즈
+                    sess.submaps.push_back(std::move(m));
+                }
+                saveSession(sessionDir, sess);
+                std::cout << "[SLAM] 세션 저장: " << sessionDir
+                          << " (" << sess.submaps.size() << " 서브맵)" << std::endl;
+            }
         }
 
         bagMap.saveToPly(outputDir + "slam_map.ply");

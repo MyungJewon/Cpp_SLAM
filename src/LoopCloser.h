@@ -41,6 +41,9 @@ public:
                                 const PoseLookup& lookup,
                                 std::ostream* log = nullptr);
 
+    // 등록된 모든 서브맵(anchor-local 점군 보관). 세션 저장에 사용.
+    const std::vector<Submap>& submaps() const { return _submaps; }
+
 private:
     std::vector<Submap> _submaps;       // 등록된 모든 서브맵 (로컬 점군 보관)
     float _searchRadius = 20.0f;        // 후보 검색 반경 (현재 추정 위치 기준)

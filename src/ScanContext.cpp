@@ -30,6 +30,17 @@ ScanContextDesc computeScanContext(const std::vector<std::array<float,3>>& point
     return desc;
 }
 
+ScanContextDesc computeScanContextCentered(const std::vector<std::array<float,3>>& points) {
+    if (points.empty()) return computeScanContext(points);
+    std::vector<float> zs; zs.reserve(points.size());
+    for (const auto& p : points) zs.push_back(p[2]);
+    std::nth_element(zs.begin(), zs.begin() + zs.size()/2, zs.end());
+    float zmed = zs[zs.size()/2];
+    std::vector<std::array<float,3>> c; c.reserve(points.size());
+    for (const auto& p : points) c.push_back({p[0], p[1], p[2] - zmed});
+    return computeScanContext(c);
+}
+
 std::pair<float,int> scanContextDistance(const ScanContextDesc& a, const ScanContextDesc& b) {
     float bestDist = std::numeric_limits<float>::max();
     int bestShift = 0;

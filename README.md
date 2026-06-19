@@ -57,8 +57,19 @@ PoseGraph 최적화 결과 ──→ MapBuilder ──→ output/slam_map.ply
 | `SubmapRegistration` | **재사용 정합 코어**. 두 Submap을 coarse-to-fine GICP로 정합 (실시간 루프 + 향후 PLY 병합 공용) |
 | `LoopCloser` | GLIM식 서브맵 기반 연속 루프 클로저. 위치 후보 → AABB → 정합 → overlap 게이트 |
 | `PoseGraph` | GTSAM iSAM2 pose graph. odometry + 신뢰도 가중 루프 BetweenFactor. `--imu` 시 X/V/B 노드 + CombinedImuFactor 통합(LIO-SAM식, 실험적) |
+| `ScanContext` | 20링×60섹터 디스크립터. 위치 무관 장소 인식 + yaw 추정(bestShift). 멀티세션 병합 후보 검색에 사용 |
+| `Session` / `SessionIO` | 세션(서브맵 목록 + 메타) 표현 및 디스크 저장/로드 (서브맵별 PLY + poses.txt) |
+| `SessionMerger` | **멀티세션 병합 코어**. ScanContext 후보검색 → GICP → 일관성 클러스터링 → GTSAM 통합 그래프 최적화 → 병합 점군 |
 | `MapBuilder` | 전역 점군 누적, keyframe 저장, PLY 저장 |
 | `PangolinViewer` | 실시간 3D 시각화 + 루프 클로저 스냅/연결선, 종료 후 창 유지 |
+
+### 실행 파일
+
+| 타깃 | 역할 |
+|------|------|
+| `slam` | 단일 bag SLAM (실시간 뷰어 포함). `--save-session`으로 병합용 세션 저장 |
+| `mapmerge` | 저장된 세션 N개를 하나의 맵으로 병합 (GUI 불필요) |
+| `test_merge` | 멀티세션 병합 단위 테스트 (SessionIO 왕복, 클러스터링) |
 
 ---
 
@@ -131,8 +142,38 @@ KDTree k-NN 으로 source 점별 공분산을 O(N log N)에 추정 (brute-force 
 Pangolin 뷰어는 매 프레임 PoseGraph 추정 궤적을 그려 루프가 닫히는 순간 화면에서 스냅되며,
 채택된 루프는 노란 연결선으로 표시됩니다. 모든 후보 시도는 `output/loops.log`에 기록됩니다.
 
-> **재사용 의도:** `SubmapRegistration`은 향후 "여러 PLY를 겹침 기반으로 자동 병합"하는
-> 오프라인 도구(MapMerger)에서 그대로 호출할 수 있도록 실시간 경로와 분리되어 있습니다.
+> **재사용 의도:** `SubmapRegistration`은 "여러 PLY를 겹침 기반으로 자동 병합"하는
+> 오프라인 도구(`mapmerge`)에서 그대로 호출되도록 실시간 경로와 분리되어 있습니다.
+
+### 멀티세션 맵 병합 (`mapmerge`)
+
+여러 bag을 각각 SLAM해 세션으로 저장한 뒤, 같은 구역을 지나는 세션들을 ScanContext
+장소 인식으로 정렬해 **하나의 일관된 맵**으로 병합합니다. 세션 간에는 좌표계 원점이
+서로 다르므로 위치 기반 검색이 불가능 → ScanContext(형태 디스크립터)로 위치 무관 후보를
+찾습니다.
+
+```
+[1단계] slam <bag> <topic> --save-session <dir>
+   SLAM(세션 내 루프 포함) 후 서브맵을 저장:
+     <dir>/submap_NNNN.ply  (anchor-local 점군)
+     <dir>/poses.txt        (보정된 anchor pose)
+
+[2단계] mapmerge <dir1> <dir2> [...] -o merged.ply [--save-session <out>]
+   1. 후보 검색: src 서브맵마다 ref 서브맵과 ScanContext 거리 top-K.
+      bestShift × (360/섹터) = yaw 초기추정. (z는 중앙값 센터링)
+   2. GICP 정합: registerSubmaps로 상대변환 + fitness/overlap 게이트.
+   3. 세션 변환 후보화: T_SR = T_anchorRef · rel · inv(T_anchorS).
+   4. 일관성 클러스터링: 서로 일치하는 최대 T_SR 군집 = 견고한 정렬.
+      클러스터 크기 < 3이면 "세션 정렬 실패" 보고 후 제외 (오정합 방지).
+   5. 통합 그래프: 전 세션 anchor가 노드. 세션내 순차 + 세션간 loop
+      BetweenFactor를 GTSAM LM으로 최적화 → 두 맵 잔여 드리프트까지 흡수.
+   6. 출력: 보정 pose로 점 변환·누적 → voxel 다운샘플 → 통계적 아웃라이어 제거.
+```
+
+핵심 원리는 단일세션 루프 클로저와 동일하며(서브맵 점이 anchor-local이라 보정된
+anchor pose로 재배치하면 됨), 차이는 **세션 간 초기 정렬**을 ScanContext가 담당한다는
+점뿐입니다. ScanContext는 실데이터에서 yaw 복원 오차 0°, 동일/상이 장소 분리 4배 마진,
+top-1 검색 8/8로 검증했고, 합성 검증에서 yaw 40°+이동 변환을 ~2mm 오차로 복원했습니다.
 
 ### IMU / Gravity 상태
 
@@ -208,6 +249,16 @@ build/slam data.bag /velodyne_points /imu/data --no-lc
 
 # IMU 타이트커플링 실험 경로 활성화
 build/slam data.bag /velodyne_points /imu/data --imu
+
+# 멀티세션 병합용 세션 저장
+build/slam bag1.bag /livox/lidar /livox/imu --save-session sessions/s1
+build/slam bag2.bag /livox/lidar /livox/imu --save-session sessions/s2
+
+# 세션 병합 → 단일 맵
+build/mapmerge sessions/s1 sessions/s2 -o output/merged.ply
+
+# 병합 품질 평가 (로버스트 span + 레퍼런스 대비 RMSE)
+python tools/eval_merge.py output/merged.ply reference.pcd
 ```
 
 | 조작 | 동작 |
@@ -274,6 +325,10 @@ build/slam data.bag /velodyne_points /imu/data --imu
 - [x] **GLIM식 서브맵 루프 클로저** (PoseMath/Submap/SubmapBuilder/SubmapRegistration/LoopCloser)
   - coarse-to-fine GICP, overlap 주 판별, 신뢰도 가중 루프 노이즈, 연속 폐합
 - [x] PoseGraph (GTSAM iSAM2) odometry + 루프 BetweenFactor 통합
+- [x] **멀티세션 맵 병합** (`mapmerge`, Session/SessionIO/SessionMerger)
+  - ScanContext 위치무관 후보검색(+yaw 추정) → GICP → 일관성 클러스터링 → GTSAM 통합 그래프
+  - E2E 검증: 자기병합 T_SR≈identity(mm 이하), yaw40°+이동 변환 ~2mm 복원, 병합 span=원본
+  - `slam --save-session`로 세션 저장, `tools/eval_merge.py`로 품질 평가
 - [~] LIO 단일 그래프 (`--imu`, X/V/B + CombinedImuFactor) — **실험적, 크래시 해소·정합 정상화는 됐으나
       누적 드리프트가 커 아직 실사용 부적합**
 
@@ -283,7 +338,8 @@ build/slam data.bag /velodyne_points /imu/data --imu
   - IMU-LiDAR 시간 동기, 초기화/바이어스 정밀 튜닝
 - [ ] Z / pitch 드리프트 보정 (순수 LiDAR 한계 — 위 LIO로 해결 목표)
 - [ ] BagParser 압축 chunk(lz4/bz2) 지원 (현재 none만)
-- [ ] 오프라인 PLY 병합 도구 (MapMerger — SubmapRegistration 재사용)
+- [ ] mapmerge 개선: 3개+ 세션 체인 정렬(현재 추가 세션은 세션0에만 정렬), 실제 2-bag 검증
+- [ ] mapmerge용 CMake에서 Pangolin 의존 분리 (현재 configure 단계에서 Pangolin 요구)
 
 > 참고: 기본 권장 구성은 **순수 LiDAR + 루프 클로저**(IMU off)입니다 — 360° 라이다에서 검증됨.
 > `--imu` LIO 경로는 실험적이며 드리프트가 커 아직 기본값이 아닙니다.
@@ -295,3 +351,5 @@ build/slam data.bag /velodyne_points /imu/data --imu
 - [FAST-LIVO2](https://github.com/hku-mars/FAST-LIVO2)
 - [KISS-ICP](https://github.com/PRBonn/kiss-icp)
 - [LIO-SAM](https://github.com/TixiaoShan/LIO-SAM)
+- [GLIM](https://github.com/koide3/glim) — 서브맵 기반 연속 폐합/멀티세션 영감
+- [Scan Context](https://github.com/irapkaist/scancontext) — 위치무관 장소 인식 디스크립터

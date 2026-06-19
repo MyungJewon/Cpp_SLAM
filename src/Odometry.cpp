@@ -328,7 +328,7 @@ void Odometry::addFrame(const std::vector<std::array<float, 3>>& rawPoints,
             });
         }
         _localMap.insertAndUpdate(worldFrameStationary, _position);
-        _localMap.slideWindow(_position, 50.0f);
+        _localMap.slideWindow(_position, 20.0f);
         _trajectory.push_back(_position);
         _lastFrame = currentFrame;
         _hasPrevDelta = false;  // 정지 후 재출발 시 stale velocity 예측 방지

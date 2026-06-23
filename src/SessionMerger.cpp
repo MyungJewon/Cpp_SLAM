@@ -54,6 +54,7 @@ float rotDist(const Pose3D& a, const Pose3D& b) {
 
 std::vector<std::array<float,3>> removeOutliers(
         const std::vector<std::array<float,3>>& pts, int k, float stdMul) {
+    if (stdMul <= 0.0f) return pts;            // 비활성 (--no-outlier)
     if ((int)pts.size() <= k+1) return pts;
     KDTree tree; tree.build(pts);
     std::vector<float> meanDist(pts.size(), 0.0f);
@@ -137,6 +138,46 @@ bool SessionMerger::bestCluster(const std::vector<InterMatch>& m,
     return true;
 }
 
+bool SessionMerger::coarseAlign(const std::vector<std::array<float,3>>& refWorld,
+                                const std::vector<std::array<float,3>>& srcWorld,
+                                Pose3D& T_SR) const {
+    if (refWorld.size() < 50 || srcWorld.size() < 50) return false;
+
+    // 다운샘플 후 임시 Submap으로 감싸 registerSubmaps 재사용 (refPose=identity, 월드=로컬).
+    Submap dst; dst.points = voxelGridFilter(refWorld, _p.coarseVoxel);
+    Submap src; src.points = voxelGridFilter(srcWorld, _p.coarseVoxel);
+
+    std::array<float,3> cs={0,0,0}, cr={0,0,0};
+    for (auto&p:src.points){cs[0]+=p[0];cs[1]+=p[1];cs[2]+=p[2];}
+    for (auto&p:dst.points){cr[0]+=p[0];cr[1]+=p[1];cr[2]+=p[2];}
+    for (int k=0;k<3;++k){cs[k]/=src.points.size();cr[k]/=dst.points.size();}
+
+    RegistrationParams rp = _p.reg;
+    rp.minOverlap = _p.coarseMinOverlap;   // 전역 정렬은 게이트를 완화
+    rp.minFitness = _p.coarseMinFitness;   // 세션 간 fitness는 낮게 나오는 게 정상
+    rp.resolutions = {2.0f, 1.0f, 0.5f};   // 거친 레벨부터 — 대칭 함정 탈출력↑
+    rp.maxIterations = 50;
+
+    bool found=false; float bestOv=-1; Pose3D best;
+    float seenOv=-1, seenFit=-1;  // 게이트 통과 여부와 무관한 최고치(진단용)
+    for (int deg=0; deg<360; deg+=_p.coarseYawStep) {
+        float a=deg*(float)M_PI/180.0f, c=std::cos(a), s=std::sin(a);
+        Matrix3x3 R={c,-s,0, s,c,0, 0,0,1};
+        // guess: src→dst, 센트로이드 정렬. t = cr - R*cs
+        auto Rcs = posemath::mulVec(R, cs);
+        Pose3D guess = {R, {cr[0]-Rcs[0], cr[1]-Rcs[1], cr[2]-Rcs[2]}};
+        RegistrationResult r = registerSubmaps(src, dst, guess, rp);
+        if (r.overlap > seenOv) { seenOv=r.overlap; seenFit=r.fitness; }
+        if (r.success && r.overlap > bestOv) { bestOv=r.overlap; best=r.relativePose; found=true; }
+    }
+    if (found) std::cout << "[Merge] 전역 정렬 성공 overlap=" << bestOv << std::endl;
+    else std::cout << "[Merge] 전역 정렬 실패 (최고치 overlap=" << seenOv
+                   << " fit=" << seenFit << ", 게이트 ov>=" << rp.minOverlap
+                   << " fit>=" << rp.minFitness << ")" << std::endl;
+    if (found) T_SR = best;
+    return found;
+}
+
 MergeResult SessionMerger::merge(const std::vector<Session>& sessions) const {
     MergeResult res;
     if (sessions.empty()) return res;
@@ -164,20 +205,64 @@ MergeResult SessionMerger::merge(const std::vector<Session>& sessions) const {
             gtsam::Symbol('x', offset[0]),
             toG(sessions[0].submaps[0].refPose), priorNoise));
 
+    // 기준 세션 월드 점군(전역 정렬용).
+    std::vector<std::array<float,3>> refWorld;
+    if (_p.coarseAlign)
+        for (const auto& m : sessions[0].submaps)
+            for (const auto& p : m.points)
+                refWorld.push_back(posemath::transformPoint(m.refPose, p));
+
     // 추가 세션 정렬 + 노드/엣지.
     std::vector<std::vector<InterMatch>> interInliers(N);
     for (int S=1; S<N; ++S) {
         auto matches = findMatches(sessions[0], sessions[S]);
+        std::cout << "[Merge] 세션 " << S << " raw 매칭 " << matches.size()
+                  << "건:" << std::endl;
+        for (const auto& e : matches) {
+            float yaw = std::atan2(e.T_SR.R[3], e.T_SR.R[0]) * 180.0f / (float)M_PI;
+            std::cout << "    ref#" << e.refIdx << " <- src#" << e.srcIdx
+                      << "  fit=" << e.fitness << " ov=" << e.overlap
+                      << "  T_SR t=(" << e.T_SR.t[0] << "," << e.T_SR.t[1]
+                      << "," << e.T_SR.t[2] << ") yaw=" << yaw << "deg" << std::endl;
+        }
+
         Pose3D T_SR; std::vector<InterMatch> inl;
-        if (!bestCluster(matches, T_SR, inl)) {
-            std::cerr << "[Merge] 세션 " << S << " 정렬 실패 (일관 매칭 "
-                      << matches.size() << "건, 클러스터 부족) — 제외" << std::endl;
+        bool ok = false;
+
+        // 1순위: 전역 정렬 (반복구조 aliasing에 강함).
+        if (_p.coarseAlign) {
+            std::vector<std::array<float,3>> srcWorld;
+            for (const auto& m : sessions[S].submaps)
+                for (const auto& p : m.points)
+                    srcWorld.push_back(posemath::transformPoint(m.refPose, p));
+            if (coarseAlign(refWorld, srcWorld, T_SR)) {
+                ok = true;
+                // 전역 T_SR과 일치하는 서브맵 매칭만 그래프 loop로 채택.
+                for (const auto& e : matches) {
+                    float dt = std::sqrt(
+                        (e.T_SR.t[0]-T_SR.t[0])*(e.T_SR.t[0]-T_SR.t[0])+
+                        (e.T_SR.t[1]-T_SR.t[1])*(e.T_SR.t[1]-T_SR.t[1])+
+                        (e.T_SR.t[2]-T_SR.t[2])*(e.T_SR.t[2]-T_SR.t[2]));
+                    float dr=0; for(int i=0;i<9;++i) dr+=e.T_SR.R[i]*T_SR.R[i];
+                    float ang=std::acos(std::max(-1.0f,std::min(1.0f,(dr-1.0f)*0.5f)));
+                    if (dt<_p.clusterTransTol && ang<_p.clusterRotTol) inl.push_back(e);
+                }
+                std::cout << "[Merge] 세션 " << S << " 전역 정렬 OK (일치 서브맵 매칭 "
+                          << inl.size() << "건)" << std::endl;
+            }
+        }
+
+        // 2순위(전역 비활성/실패): 서브맵 매칭 클러스터링.
+        if (!ok) ok = bestCluster(matches, T_SR, inl);
+
+        if (!ok) {
+            std::cerr << "[Merge] 세션 " << S << " 정렬 실패 — 제외" << std::endl;
             continue;
         }
         accepted[S]=true; sessionT[S]=T_SR; interInliers[S]=inl;
-        std::cout << "[Merge] 세션 " << S << " 정렬 OK (인라이어 " << inl.size()
-                  << ", T_SR t=(" << T_SR.t[0] << "," << T_SR.t[1] << ","
-                  << T_SR.t[2] << "))" << std::endl;
+        std::cout << "[Merge] 세션 " << S << " 정렬 채택 (T_SR t=(" << T_SR.t[0]
+                  << "," << T_SR.t[1] << "," << T_SR.t[2] << "), loop "
+                  << inl.size() << "건)" << std::endl;
         for (size_t k=0;k<sessions[S].submaps.size();++k) {
             Pose3D init = posemath::compose(T_SR, sessions[S].submaps[k].refPose);
             initial.insert(gtsam::Symbol('x', offset[S]+(int)k), toG(init));
@@ -200,6 +285,14 @@ MergeResult SessionMerger::merge(const std::vector<Session>& sessions) const {
     // 세션 간 엣지 (인라이어). 측정 = relativePose (src로컬→ref로컬 = inv(T_ref)·T_src).
     for (int S=1; S<N; ++S) {
         if (!accepted[S]) continue;
+        // loop가 없으면 체인이 떠버리므로 첫 노드에 전역정렬 pose로 prior를 걸어 고정.
+        if (interInliers[S].empty() && !sessions[S].submaps.empty()) {
+            Pose3D init = posemath::compose(sessionT[S], sessions[S].submaps[0].refPose);
+            graph.add(gtsam::PriorFactor<gtsam::Pose3>(
+                gtsam::Symbol('x', offset[S]), toG(init), diag6(0.1, 0.2)));
+            std::cout << "[Merge] 세션 " << S
+                      << " loop 0건 — 전역 정렬로 강체 배치(prior 고정)" << std::endl;
+        }
         for (const auto& e : interInliers[S]) {
             float conf = std::min(std::max(e.overlap*e.fitness, 0.1f), 1.0f);
             auto loopNoise = gtsam::noiseModel::Robust::Create(
@@ -223,25 +316,24 @@ MergeResult SessionMerger::merge(const std::vector<Session>& sessions) const {
         result = initial;
     }
 
-    // 보정 포즈 추출 + 점군 누적.
+    // 보정 포즈 추출 + 점군 누적 (세션별로 필터링해 점마다 세션 id 유지 — 색상 출력용).
     res.poses.resize(N);
-    std::vector<std::array<float,3>> merged;
     for (int S=0; S<N; ++S) {
         if (!accepted[S]) { res.poses[S] = {}; continue; }
         res.poses[S].resize(sessions[S].submaps.size());
+        std::vector<std::array<float,3>> sCloud;
         for (size_t k=0;k<sessions[S].submaps.size();++k) {
             gtsam::Symbol sym('x', offset[S]+(int)k);
             Pose3D wp = result.exists(sym) ? fromG(result.at<gtsam::Pose3>(sym))
                                            : sessions[S].submaps[k].refPose;
             res.poses[S][k]=wp;
             for (const auto& p : sessions[S].submaps[k].points)
-                merged.push_back(posemath::transformPoint(wp, p));
+                sCloud.push_back(posemath::transformPoint(wp, p));
         }
+        sCloud = voxelGridFilter(sCloud, _p.outputVoxel);
+        sCloud = removeOutliers(sCloud, _p.outlierK, _p.outlierStdMul);
+        for (const auto& p : sCloud) { res.cloud.push_back(p); res.sessionId.push_back(S); }
     }
-
-    merged = voxelGridFilter(merged, _p.outputVoxel);
-    merged = removeOutliers(merged, _p.outlierK, _p.outlierStdMul);
-    res.cloud = std::move(merged);
     res.success = true;
     return res;
 }

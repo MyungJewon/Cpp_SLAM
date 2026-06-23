@@ -59,7 +59,7 @@ PoseGraph 최적화 결과 ──→ MapBuilder ──→ output/slam_map.ply
 | `PoseGraph` | GTSAM iSAM2 pose graph. odometry + 신뢰도 가중 루프 BetweenFactor. `--imu` 시 X/V/B 노드 + CombinedImuFactor 통합(LIO-SAM식, 실험적) |
 | `ScanContext` | 20링×60섹터 디스크립터. 위치 무관 장소 인식 + yaw 추정(bestShift). 멀티세션 병합 후보 검색에 사용 |
 | `Session` / `SessionIO` | 세션(서브맵 목록 + 메타) 표현 및 디스크 저장/로드 (서브맵별 PLY + poses.txt) |
-| `SessionMerger` | **멀티세션 병합 코어**. ScanContext 후보검색 → GICP → 일관성 클러스터링 → GTSAM 통합 그래프 최적화 → 병합 점군 |
+| `SessionMerger` | **멀티세션 병합 코어**. 전역 정렬(yaw 스윕 GICP) → ScanContext 후보/클러스터링 → GTSAM 통합 그래프 → 병합 점군. (대칭 구조에서 자동 정렬 불안정 — 아래 한계 참조) |
 | `MapBuilder` | 전역 점군 누적, keyframe 저장, PLY 저장 |
 | `PangolinViewer` | 실시간 3D 시각화 + 루프 클로저 스냅/연결선, 종료 후 창 유지 |
 
@@ -158,22 +158,39 @@ Pangolin 뷰어는 매 프레임 PoseGraph 추정 궤적을 그려 루프가 닫
      <dir>/submap_NNNN.ply  (anchor-local 점군)
      <dir>/poses.txt        (보정된 anchor pose)
 
-[2단계] mapmerge <dir1> <dir2> [...] -o merged.ply [--save-session <out>]
-   1. 후보 검색: src 서브맵마다 ref 서브맵과 ScanContext 거리 top-K.
-      bestShift × (360/섹터) = yaw 초기추정. (z는 중앙값 센터링)
-   2. GICP 정합: registerSubmaps로 상대변환 + fitness/overlap 게이트.
-   3. 세션 변환 후보화: T_SR = T_anchorRef · rel · inv(T_anchorS).
-   4. 일관성 클러스터링: 서로 일치하는 최대 T_SR 군집 = 견고한 정렬.
-      클러스터 크기 < 3이면 "세션 정렬 실패" 보고 후 제외 (오정합 방지).
-   5. 통합 그래프: 전 세션 anchor가 노드. 세션내 순차 + 세션간 loop
-      BetweenFactor를 GTSAM LM으로 최적화 → 두 맵 잔여 드리프트까지 흡수.
-   6. 출력: 보정 pose로 점 변환·누적 → voxel 다운샘플 → 통계적 아웃라이어 제거.
+[2단계] mapmerge <dir1> <dir2> [...] -o merged.ply
+   A. 전역 정렬(coarseAlign): 세션 전체 점군을 yaw 스윕(10°) GICP로 통째 정합
+      → 거친 T_SR(세션S 월드 → 기준 월드) 추정. (1순위)
+   B. (전역 실패 시) 서브맵 ScanContext 후보 → GICP → 일관성 클러스터링. (2순위)
+   C. 통합 그래프: 전 세션 anchor가 노드. 세션내 순차 + 전역정렬에 일치하는
+      세션간 loop BetweenFactor를 GTSAM LM으로 최적화. loop가 0건이면 전역
+      정렬값으로 강체 배치(prior 고정).
+   D. 출력: 보정 pose로 점 변환·누적 → 세션별 voxel 다운샘플 + 아웃라이어 제거.
+      --colored 시 세션별 색상 PLY(세션0=빨강, 1=파랑)도 저장(정렬 육안 검증용).
 ```
 
 핵심 원리는 단일세션 루프 클로저와 동일하며(서브맵 점이 anchor-local이라 보정된
-anchor pose로 재배치하면 됨), 차이는 **세션 간 초기 정렬**을 ScanContext가 담당한다는
-점뿐입니다. ScanContext는 실데이터에서 yaw 복원 오차 0°, 동일/상이 장소 분리 4배 마진,
-top-1 검색 8/8로 검증했고, 합성 검증에서 yaw 40°+이동 변환을 ~2mm 오차로 복원했습니다.
+anchor pose로 재배치하면 됨), 차이는 **세션 간 초기 정렬**을 어떻게 잡느냐입니다.
+정렬값만 정해지면 그 다음 정제는 루프 클로저와 같은 메커니즘으로 동작합니다.
+
+#### 알려진 한계: 대칭 구조에서 자동 전역 정렬 불안정 ⚠️
+
+ScanContext 자체는 견고합니다(실데이터에서 yaw 복원 오차 0°, 동일/상이 장소 분리 4배
+마진, top-1 검색 8/8; 합성 검증에서 yaw 40°+이동을 ~2mm 오차로 복원). **그러나
+실데이터(반복·대칭 건물) 두 세션 병합에서, 자동 전역 정렬이 180° 뒤집힌 가짜 골짜기에
+빠지는 현상을 확인했습니다.**
+
+- 원인: 건물이 180° 회전에 거의 대칭이라, "올바른 정렬"과 "뒤집힌 정렬"의 overlap이
+  비슷(예: 0.46 vs 정답 0.63)해 자동 지표로 구분이 안 됨. yaw 스윕을 촘촘히 해도
+  지표 자체가 둘을 못 가르므로 해결되지 않음.
+- 이는 알고리즘 결함이 아니라 **전역 자동 정렬의 원리적 한계**이며, 같은 이유로 GLIM
+  등 멀티세션 시스템은 **수동 초기 정렬 단계**를 둡니다.
+- 참고: 동일 데이터에 대한 외부 검증(전체 점군 yaw 스윕 ICP)에서는 올바른 정렬
+  (yaw≈-80°, t≈(5.6,16.7), overlap 0.63)이 존재함을 확인 — 즉 두 맵은 실제로 겹치며,
+  문제는 "자동이 그 골짜기를 안정적으로 고르지 못함"입니다.
+
+→ **다음 단계: 수동 초기 정렬 힌트**(`--init-yaw`, `--init-t`)를 추가해 GLIM식으로
+   사용자가 대략의 방향만 주면 GICP가 정밀화하도록 할 예정. (향후 과제 참조)
 
 ### IMU / Gravity 상태
 
@@ -325,10 +342,11 @@ python tools/eval_merge.py output/merged.ply reference.pcd
 - [x] **GLIM식 서브맵 루프 클로저** (PoseMath/Submap/SubmapBuilder/SubmapRegistration/LoopCloser)
   - coarse-to-fine GICP, overlap 주 판별, 신뢰도 가중 루프 노이즈, 연속 폐합
 - [x] PoseGraph (GTSAM iSAM2) odometry + 루프 BetweenFactor 통합
-- [x] **멀티세션 맵 병합** (`mapmerge`, Session/SessionIO/SessionMerger)
-  - ScanContext 위치무관 후보검색(+yaw 추정) → GICP → 일관성 클러스터링 → GTSAM 통합 그래프
-  - E2E 검증: 자기병합 T_SR≈identity(mm 이하), yaw40°+이동 변환 ~2mm 복원, 병합 span=원본
-  - `slam --save-session`로 세션 저장, `tools/eval_merge.py`로 품질 평가
+- [~] **멀티세션 맵 병합** (`mapmerge`, Session/SessionIO/SessionMerger) — **파이프라인 완성, 자동 정렬은 한계**
+  - 파이프라인: 전역 정렬(yaw 스윕 GICP) → ScanContext/클러스터링 → GTSAM 통합 그래프 → 병합
+  - 합성 검증 통과: 자기병합 T_SR≈identity(mm 이하), yaw40°+이동 ~2mm 복원
+  - **실데이터 한계: 대칭 건물에서 자동 전역 정렬이 180° 가짜 골짜기에 빠짐** (위 「알려진 한계」 참조)
+  - 도구: `slam --save-session`, `mapmerge --colored`(육안검증), `tools/eval_merge.py`(RMSE)
 - [~] LIO 단일 그래프 (`--imu`, X/V/B + CombinedImuFactor) — **실험적, 크래시 해소·정합 정상화는 됐으나
       누적 드리프트가 커 아직 실사용 부적합**
 
@@ -338,7 +356,9 @@ python tools/eval_merge.py output/merged.ply reference.pcd
   - IMU-LiDAR 시간 동기, 초기화/바이어스 정밀 튜닝
 - [ ] Z / pitch 드리프트 보정 (순수 LiDAR 한계 — 위 LIO로 해결 목표)
 - [ ] BagParser 압축 chunk(lz4/bz2) 지원 (현재 none만)
-- [ ] mapmerge 개선: 3개+ 세션 체인 정렬(현재 추가 세션은 세션0에만 정렬), 실제 2-bag 검증
+- [ ] **mapmerge 수동 초기 정렬 힌트** (`--init-yaw`, `--init-t`) — 대칭 구조 180° 모호성
+      해결의 핵심. GLIM식으로 사용자가 대략 방향만 주면 GICP가 정밀화 (현재 최우선)
+- [ ] mapmerge 개선: 3개+ 세션 체인 정렬(현재 추가 세션은 세션0에만 정렬)
 - [ ] mapmerge용 CMake에서 Pangolin 의존 분리 (현재 configure 단계에서 Pangolin 요구)
 
 > 참고: 기본 권장 구성은 **순수 LiDAR + 루프 클로저**(IMU off)입니다 — 360° 라이다에서 검증됨.

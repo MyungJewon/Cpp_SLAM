@@ -131,6 +131,12 @@ Odometry::Odometry(float voxelSize)
 void Odometry::addFrame(const std::vector<std::array<float, 3>>& rawPoints,
                         const std::vector<float>* pointTimes)
 {
+    // 프레임 상태 초기화 — 조기 return(품질부족/게이팅) 경로는 accepted=false 유지.
+    // back-end가 이 상태로 odometry factor 노이즈를 적응시킨다 (스킵 프레임 = IMU 브릿지).
+    _lastFitness = 0.0f;
+    _lastAccepted = false;
+    _lastStationary = false;
+
     const std::vector<std::array<float, 3>>* filterInput = &rawPoints;
     std::vector<std::array<float, 3>> deskewed;
 
@@ -332,6 +338,9 @@ void Odometry::addFrame(const std::vector<std::array<float, 3>>& rawPoints,
         _trajectory.push_back(_position);
         _lastFrame = currentFrame;
         _hasPrevDelta = false;  // 정지 후 재출발 시 stale velocity 예측 방지
+        _lastFitness = icp.fitness;
+        _lastAccepted = true;
+        _lastStationary = true;  // ZUPT(정지 시 속도=0 factor)용
         return;
     }
 
@@ -375,10 +384,13 @@ void Odometry::addFrame(const std::vector<std::array<float, 3>>& rawPoints,
         worldFrame.push_back(pWorld);
     }
     _localMap.insertAndUpdate(worldFrame, _position);
-    _localMap.slideWindow(_position, 50.0f);
+    _localMap.slideWindow(_position, 20.0f);
 
     _lastFrame = currentFrame;
     _trajectory.push_back(_position);
+    _lastFitness = icp.fitness;
+    _lastAccepted = true;
+    _lastStationary = false;
 
     std::cout << "[Odometry] 프레임 " << _trajectory.size()
               << " | 위치: (" << _position[0] << ", "

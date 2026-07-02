@@ -27,7 +27,7 @@ ROS1 Bag
                                                 (신뢰도 가중 노이즈)
 
 옵션:
-  --imu    IMU 타이트커플링(LIO) 실험 경로 활성화 (실험적, 아직 실사용 부적합)
+  --imu    IMU 타이트커플링(LIO) 실험 경로 활성화 (안전 동작하나 맵 품질 낮음 — 봉인, 기본 비권장)
   기본값   타이트커플링 OFF (IMU는 회전 deskew 전용)
 
 PoseGraph 최적화 결과 ──→ MapBuilder ──→ output/slam_map.ply
@@ -198,24 +198,35 @@ ScanContext 자체는 견고합니다(실데이터에서 yaw 복원 오차 0°, 
   들어가 **회전 deskew와 gravity 측정 보관에만** 쓰입니다. 실제 포즈는 순수 LiDAR GICP로 추정.
 - `Odometry`/`ICP`의 gravity prior 훅(`_gravityScale = 0.0f`), `PoseGraph` attitude factor는 비활성.
 
-#### `--imu` LIO 타이트커플링 (실험적, 아직 실사용 부적합)
+#### `--imu` LIO 타이트커플링 (실험 종결 — 안전하게 켜지지만 순수 LiDAR가 우세)
 
 `--imu`를 주면 IMU를 **메인 `PoseGraph`에 직접 통합**합니다 (LIO-SAM식 단일 그래프):
 X/V/B 노드 + `CombinedImuFactor`가 GICP odometry(BetweenFactor) + 루프 factor와 같은
 iSAM2 그래프에서 동시 최적화됩니다. 시작 정지 구간 가속도계로 nav 중력 방향을 설정하고,
 IMU 노이즈는 FAST-LIVO2 avia 값(loose)을 사용합니다.
 
-진행 경과:
-- 초기 별도 그래프(`ImuOdometry`)가 pose를 override하던 방식은 점군을 망가뜨려(정합 fitness 붕괴) **폐기**.
-- 단일 그래프로 전환 후: 발산 크래시 해소(try/catch + 공백구간 v/b 구속), 점군 정합 정상화,
-  일부 데이터에서 z 드리프트 감소(예: data_2 z 4m→1.5m) 확인.
+진행 경과 (시간순):
+- 별도 그래프(`ImuOdometry`)의 pose override 방식 → 점군 붕괴로 **폐기**.
+- 단일 그래프 전환 → 크래시 해소, 정합 정상화. 그러나 드리프트 잔존.
+- **fitness 적응 odometry 노이즈** 도입: fitness 높으면 타이트(IMU 후퇴),
+  낮으면/스킵 프레임이면 루즈(IMU 브릿지). + 정지 프레임 **ZUPT**(속도=0 prior).
+  - 1차 시도(하한 σ×6.7 루즈)는 **중력 모델 오차가 z를 +9.3m 폭주**시키고 루프 전멸
+    — 중력 오차는 world-frame 상수라 바이어스로 흡수 불가.
+  - 하한을 σ×2로 강화 + **v_z 감쇠 prior**(σ 0.3m/s, 수평 비구속) → 폭주 해결.
 
-**그러나 여전히 누적 드리프트가 커서 실사용 수준은 아닙니다.** 강한 LiDAR(360°) 데이터에서는
-IMU가 루프 검출을 다소 떨어뜨리고, 약한 FOV(Livox)에서는 드리프트 억제가 충분치 않습니다.
-완성하려면 LiDAR 신뢰도(fitness) 기반 적응 가중, IMU-LiDAR 시간 동기/정밀 튜닝, 초기화 개선이 필요합니다.
+최종 실측 (data_2, 동일 조건 비교):
 
-- 좁은 FOV Livox(예: hku_main_building)는 순수 LiDAR만으로는 pitch/z 드리프트가 크며,
-  이 격차를 제대로 메우는 것이 향후 핵심 과제입니다.
+| 지표 | `--imu` (최종) | IMU off |
+|---|---|---|
+| 궤적 z | 0~1.3m (평평) | 0~1.8m |
+| 루프 | 35개+, fitness 최대 0.86 | 30개, 0.85 |
+| **맵 z 두께(robust)** | **13.6m** | **6.1m** |
+
+**결론: 폭주·크래시 없이 안전하게 동작하지만, pitch/roll 미세 흔들림으로 점군이
+수직으로 퍼져 맵 품질이 순수 LiDAR의 절반입니다.** 이 격차를 넘으려면 중력을 상태로
+추정(FAST-LIO식)하는 대공사가 필요하며, LiDAR가 강한 데이터에서는 보상이 없어
+**실험 기능으로 봉인**합니다. 재개 조건: LiDAR가 실제로 열화되는 데이터
+(빠른 모션, 좁은 FOV 복도 등)가 확보될 때.
 
 ---
 
@@ -307,7 +318,9 @@ python tools/eval_merge.py output/merged.ply reference.pcd
 | `setGroundMode(false)` | false | 씬 무관 3D 추적 |
 | `setMaxStepDist(3.5f)` | 3.5m | 프레임당 최대 허용 이동 거리 |
 | `_stationaryStepM` | 0.03m | 정지 판정 이동 임계값 |
-| `_voxelSize` | 0.5m | Voxel 크기 |
+| `_voxelSize` | 0.2m | Voxel 크기 (0.5→0.2로 정합 정밀도·z 드리프트 대폭 개선) |
+| slideWindow | 20m | 로컬맵 유지 반경 (정지/메인 경로 통일) |
+| odometry 노이즈 | fitness 적응 | sigma = base/clamp(fitness/0.4, 0.5, 2.0). base 0.05rad/0.1m |
 | `setEigenFloor` | 1e-3 | 공분산 고유값 상대 플로어 |
 | `kMinCovPoints` (ICP) | 6 | 대응에 쓸 voxel 최소 점수 |
 | `useImuOdom` | false | 기본 IMU 타이트커플링 비활성. `--imu` 옵션에서 활성 |
@@ -347,22 +360,27 @@ python tools/eval_merge.py output/merged.ply reference.pcd
   - 합성 검증 통과: 자기병합 T_SR≈identity(mm 이하), yaw40°+이동 ~2mm 복원
   - **실데이터 한계: 대칭 건물에서 자동 전역 정렬이 180° 가짜 골짜기에 빠짐** (위 「알려진 한계」 참조)
   - 도구: `slam --save-session`, `mapmerge --colored`(육안검증), `tools/eval_merge.py`(RMSE)
-- [~] LIO 단일 그래프 (`--imu`, X/V/B + CombinedImuFactor) — **실험적, 크래시 해소·정합 정상화는 됐으나
-      누적 드리프트가 커 아직 실사용 부적합**
+- [~] LIO 단일 그래프 (`--imu`, X/V/B + CombinedImuFactor) — **실험 종결(봉인)**
+  - fitness 적응 odometry 노이즈 + ZUPT + v_z 감쇠 prior로 z 폭주(+9.3m) 해결,
+    루프 35개 회복 (궤적 z 0~1.3m 평평)
+  - 그러나 pitch/roll 미세 흔들림으로 **맵 z 두께 13.6m vs 순수 LiDAR 6.1m** —
+    순수 LiDAR 확정 우세. 재개 조건: LiDAR가 실제 열화되는 데이터 확보 시
+- [x] fitness 적응 odometry 노이즈 + 스킵 프레임 IMU 브릿지 + ZUPT (PoseGraph/Odometry)
+- [x] slideWindow 불일치 버그 수정 (메인 경로 50→20m 통일)
 
 ### 진행 중 / 향후 과제
-- [ ] **`--imu` LIO 드리프트 안정화** (현재 최우선) — 누적 드리프트가 커 실사용 불가
-  - LiDAR fitness 기반 적응 가중 (LiDAR 강할 때 IMU 비켜주고 약할 때만 받치기)
-  - IMU-LiDAR 시간 동기, 초기화/바이어스 정밀 튜닝
-- [ ] Z / pitch 드리프트 보정 (순수 LiDAR 한계 — 위 LIO로 해결 목표)
-- [ ] BagParser 압축 chunk(lz4/bz2) 지원 (현재 none만)
 - [ ] **mapmerge 수동 초기 정렬 힌트** (`--init-yaw`, `--init-t`) — 대칭 구조 180° 모호성
       해결의 핵심. GLIM식으로 사용자가 대략 방향만 주면 GICP가 정밀화 (현재 최우선)
+- [ ] ScanContext 2차 루프 후보 검색 — 드리프트가 searchRadius(12m) 초과 시 루프 복구
+      (부품 검증 완료, 연결만 남음. `docs/성능_분석_및_개선방안.md` 참조)
 - [ ] mapmerge 개선: 3개+ 세션 체인 정렬(현재 추가 세션은 세션0에만 정렬)
 - [ ] mapmerge용 CMake에서 Pangolin 의존 분리 (현재 configure 단계에서 Pangolin 요구)
+- [ ] BagParser 압축 chunk(lz4/bz2) 지원 (현재 none만)
+- [ ] (봉인 해제 시) LIO 중력 상태 추정(FAST-LIO식) — 현 데이터에선 보상 없음
 
 > 참고: 기본 권장 구성은 **순수 LiDAR + 루프 클로저**(IMU off)입니다 — 360° 라이다에서 검증됨.
-> `--imu` LIO 경로는 실험적이며 드리프트가 커 아직 기본값이 아닙니다.
+> `--imu`는 안전하게 동작하나(폭주/크래시 없음) 맵 품질이 낮아 기본값이 아닙니다.
+> 상세 성능 분석과 개선 로드맵: `docs/성능_분석_및_개선방안.md`
 
 ---
 

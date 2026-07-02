@@ -30,9 +30,16 @@ public:
 
     // deltaPose: 직전 노드 대비 상대 변환 (GICP scan-to-map 측정값).
     // gravityBodyUp: 이 노드의 IMU 중력(바디 좌표). nullptr이면 자세 factor 미추가.
+    // lidarFitness: GICP fitness(0~1). >=0이면 odometry 노이즈를 적응 조절 —
+    //   fitness 높음 → 타이트(LiDAR 신뢰, IMU 물러남), 낮음/스킵(0) → 루즈(IMU 브릿지).
+    //   -1이면 기존 고정 노이즈.
+    // stationary: true면(정지 감지) IMU 활성 시 속도=0 prior(ZUPT) 추가 —
+    //   handheld 정지 구간에서 속도/바이어스 드리프트를 리셋.
     // IMU가 활성화되어 있으면 누적된 preintegration으로 CombinedImuFactor도 함께 추가한다.
     Pose3D addOdometry(const Pose3D& deltaPose,
-                       const std::array<float, 3>* gravityBodyUp = nullptr);
+                       const std::array<float, 3>* gravityBodyUp = nullptr,
+                       float lidarFitness = -1.0f,
+                       bool stationary = false);
     // confidence: 정합 신뢰도(0~1, 보통 overlap×fitness). 높을수록 루프를 강하게 구속한다.
     // GLIM의 Hessian 기반 정보행렬 가중을 근사 — 약한 루프는 영향이 작아진다.
     std::vector<Pose3D> addLoopClosure(int fromId, int toId, const Pose3D& relativePose,

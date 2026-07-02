@@ -189,7 +189,9 @@ void PoseGraph::integrateImu(const std::vector<ImuSample>& samples)
 }
 
 Pose3D PoseGraph::addOdometry(const Pose3D& deltaPose,
-                             const std::array<float, 3>* gravityBodyUp)
+                             const std::array<float, 3>* gravityBodyUp,
+                             float lidarFitness,
+                             bool stationary)
 {
     const int fromId = _currentId;
     const int toId = _currentId + 1;
@@ -197,9 +199,22 @@ Pose3D PoseGraph::addOdometry(const Pose3D& deltaPose,
     const gtsam::Pose3 previous = _impl->estimate.at<gtsam::Pose3>(key(fromId));
     const gtsam::Pose3 predicted = previous.compose(delta);
 
+    // fitness 적응 odometry 노이즈: sigma = base / s, s = clamp(fitness/0.4, 0.5, 2.0)
+    //   fitness 0.8 → sigma 절반 (LiDAR 강신뢰 → IMU가 자연히 물러남)
+    //   fitness 낮음/스킵 → 최대 2배 루즈까지만 (0.1rad/0.2m 바닥).
+    // 주의: 하한을 0.15로 뒀더니(σ~0.67m) 중력 모델 오차가 그 틈으로 z를 폭주시켰음
+    //   (z +9.3m, 루프 전멸 — 2026-07 imu_on 실측). 브릿지는 "약간 루즈"까지만 허용.
+    gtsam::SharedNoiseModel odomNoise = _impl->odomNoise;
+    if (lidarFitness >= 0.0f)
+    {
+        const double s = std::max(0.5, std::min(2.0, (double)lidarFitness / 0.4));
+        odomNoise = diagonalNoise(0.05 / s, 0.05 / s, 0.05 / s,
+                                  0.1 / s, 0.1 / s, 0.1 / s);
+    }
+
     gtsam::NonlinearFactorGraph graph;
     gtsam::Values initial;
-    graph.add(gtsam::BetweenFactor<gtsam::Pose3>(key(fromId), key(toId), delta, _impl->odomNoise));
+    graph.add(gtsam::BetweenFactor<gtsam::Pose3>(key(fromId), key(toId), delta, odomNoise));
     initial.insert(key(toId), predicted);
 
     // IMU 중력 자세 factor: 바디 "위"(bRef)가 월드 up(nZ=(0,0,1))에 정렬되도록.
@@ -260,6 +275,26 @@ Pose3D PoseGraph::addOdometry(const Pose3D& deltaPose,
         }
         initial.insert(vKey(toId), predVel);
         initial.insert(bKey(toId), prevBias);
+
+        // ZUPT: front-end가 정지로 판정한 프레임은 속도=0 prior로 강하게 구속.
+        // handheld는 정지가 잦으므로 IMU 속도/바이어스 드리프트가 주기적으로 리셋된다.
+        if (stationary)
+        {
+            graph.add(gtsam::PriorFactor<gtsam::Vector3>(
+                vKey(toId), gtsam::Vector3(0, 0, 0),
+                gtsam::noiseModel::Isotropic::Sigma(3, 0.05)));
+        }
+        else
+        {
+            // z속도 감쇠 prior: 실내 handheld는 수직 이동이 거의 없다.
+            // 중력 모델 오차(world-frame 상수)는 바이어스로 흡수가 안 돼 z 폭주를
+            // 일으키므로, v_z만 약하게 0으로 감쇠해 수직 런어웨이를 차단한다.
+            // 수평(v_x,v_y)은 사실상 비구속(σ 5m/s).
+            gtsam::Vector3 vzSigmas(5.0, 5.0, 0.3);
+            graph.add(gtsam::PriorFactor<gtsam::Vector3>(
+                vKey(toId), gtsam::Vector3(0, 0, 0),
+                gtsam::noiseModel::Diagonal::Sigmas(vzSigmas)));
+        }
     }
 
     try

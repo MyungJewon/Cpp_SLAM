@@ -391,7 +391,13 @@ int main(int argc, char* argv[])
                 Pose3D delta = relativePose(prevPose, currentPose);
                 // GICP delta는 LiDAR 측정 BetweenFactor로, IMU는 CombinedImuFactor로
                 // 같은 그래프에서 동시 최적화 (addOdometry 내부에서 처리).
-                poseGraph.addOdometry(delta);
+                // fitness 적응 노이즈: 스킵(품질부족) 프레임은 fitness 0 → 루즈 →
+                // identity delta가 그래프를 못 잡아두고 IMU가 브릿지한다.
+                // 정지 프레임은 ZUPT(속도=0 prior)로 IMU 드리프트 리셋.
+                const float lidarFit =
+                    bagOdom.wasLastFrameAccepted() ? bagOdom.getLastFitness() : 0.0f;
+                poseGraph.addOdometry(delta, nullptr, lidarFit,
+                                      bagOdom.wasLastStationary());
             }
             prevPose = currentPose;
 

@@ -42,6 +42,14 @@ public:
         return _lastHasGravity;
     }
 
+    // 마지막 프레임의 ICP 품질/상태 — back-end 적응 노이즈·ZUPT용.
+    //   getLastFitness()      : GICP inlier 비율 (0~1)
+    //   wasLastFrameAccepted(): false면 품질부족/게이팅으로 포즈 유지(스킵)된 프레임
+    //   wasLastStationary()   : 정지 감지된 프레임 (ZUPT 대상)
+    float getLastFitness() const { return _lastFitness; }
+    bool  wasLastFrameAccepted() const { return _lastAccepted; }
+    bool  wasLastStationary() const { return _lastStationary; }
+
     // 지면 구속 모드: z=0 고정, Yaw(수평 회전)만 추적
     void setGroundMode(bool enabled) { _groundMode = enabled; }
 
@@ -92,4 +100,8 @@ private:
     float _gravityScale       = 0.0f;   // 중력 prior 가중치 (0=비활성). 게이팅 재설계 전까지 끔.
     std::array<float, 3> _lastGravityUp = {0.0f, 0.0f, 1.0f};  // 마지막 프레임 중력(바디)
     bool _lastHasGravity = false;
+
+    float _lastFitness    = 0.0f;   // 마지막 프레임 GICP fitness
+    bool  _lastAccepted   = false;  // 마지막 프레임이 정상 채택됐는가 (스킵이면 false)
+    bool  _lastStationary = false;  // 마지막 프레임이 정지로 판정됐는가
 };

@@ -311,6 +311,16 @@ python tools/eval_merge.py output/merged.ply reference.pcd
 
 ---
 
+## 실행 결과
+
+| SLAM 과정 영상 | 3D 맵핑 결과 (Pangolin 시각화 / 전역 맵) |
+| :---: | :---: |
+| <img src="" width="400" > | <img src="<img width="1348" height="820" alt="스크린샷 2026-07-02 오후 4 52 07" src="https://github.com/user-attachments/assets/db2abb2f-7f5c-4d3e-8834-d347c3767aae" />
+ width="400" alt="3D SLAM 결과 맵"> |
+| *테스트에 사용된 센서 구성 및 주행 환경* | *Pangolin 뷰어 실시간 시각화 및 루프 클로저 연결선* |
+
+---
+
 ## 주요 파라미터 (`main.cpp`)
 
 | 설정 | 현재값 | 설명 |

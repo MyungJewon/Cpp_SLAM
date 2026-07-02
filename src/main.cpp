@@ -235,6 +235,7 @@ int main(int argc, char* argv[])
     bool useLoopClosure = true;
     bool useImuOdom = false;
     std::string sessionDir;  // --save-session <dir>: 멀티세션 병합용 세션 저장
+    float maxRange = 80.0f;   // --max-range: 입력 range 필터(m). 초장거리 노이즈 제거
     std::vector<std::string> posArgs;
     for (int i = 1; i < argc; ++i)
     {
@@ -247,6 +248,8 @@ int main(int argc, char* argv[])
             useImuOdom = false;
         else if (a == "--save-session" && i + 1 < argc)
             sessionDir = argv[++i];
+        else if (a == "--max-range" && i + 1 < argc)
+            maxRange = std::stof(argv[++i]);
         else
             posArgs.push_back(a);
     }
@@ -280,6 +283,7 @@ int main(int argc, char* argv[])
 
     bagOdom.setGroundMode(false);
     bagOdom.setMaxStepDist(3.5f);
+    bagOdom.setMaxRange(maxRange);
     bagOdom.setImuPreintegrator(&imu);
     bagOdom.setLocalMapMaxPts(5000);
     bagOdom.setStationaryThresh(0.03f, 0.5f);
@@ -391,13 +395,18 @@ int main(int argc, char* argv[])
                 Pose3D delta = relativePose(prevPose, currentPose);
                 // GICP delta는 LiDAR 측정 BetweenFactor로, IMU는 CombinedImuFactor로
                 // 같은 그래프에서 동시 최적화 (addOdometry 내부에서 처리).
-                // fitness 적응 노이즈: 스킵(품질부족) 프레임은 fitness 0 → 루즈 →
-                // identity delta가 그래프를 못 잡아두고 IMU가 브릿지한다.
-                // 정지 프레임은 ZUPT(속도=0 prior)로 IMU 드리프트 리셋.
-                const float lidarFit =
-                    bagOdom.wasLastFrameAccepted() ? bagOdom.getLastFitness() : 0.0f;
-                poseGraph.addOdometry(delta, nullptr, lidarFit,
-                                      bagOdom.wasLastStationary());
+                // fitness 적응 노이즈 + ZUPT는 IMU 모드에서만 켠다.
+                //   IMU-off: 고정 노이즈(lidarFitness=-1) — 적응 루즈가 fast-motion에서
+                //     pose graph를 못 눌러 맵이 터지는 회귀를 피함(순수 LiDAR는 검증된 고정값).
+                //   IMU-on: 적응(스킵 프레임=fitness0→루즈→IMU 브릿지) + 정지 ZUPT.
+                float lidarFit = -1.0f;
+                bool  stationary = false;
+                if (useImuOdom)
+                {
+                    lidarFit = bagOdom.wasLastFrameAccepted() ? bagOdom.getLastFitness() : 0.0f;
+                    stationary = bagOdom.wasLastStationary();
+                }
+                poseGraph.addOdometry(delta, nullptr, lidarFit, stationary);
             }
             prevPose = currentPose;
 

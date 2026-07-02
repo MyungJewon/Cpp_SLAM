@@ -2,6 +2,7 @@
 #pragma once
 #include <array>
 #include <vector>
+#include <cmath>
 #include "ICP.h"
 #include "VoxelGrid.h"
 #include "VoxelMap.h"
@@ -56,6 +57,10 @@ public:
     // 프레임당 최대 허용 이동 거리 (기본 2.0m) — 초과 시 ICP 실패로 무시
     void setMaxStepDist(float m) { _maxStepDist = m; }
 
+    // 입력 range 필터: 센서에서 이 거리(m) 초과 점을 버림 (기본 80m, 0=비활성).
+    // 초장거리 노이즈 점이 맵을 오염시키는 것 방지.
+    void setMaxRange(float m) { _maxRange = m; }
+
     // ICP 대상 로컬 맵 최대 점 개수 (기본 5000) — 클수록 정확하지만 느림
     void setLocalMapMaxPts(int n) { _localMapMaxPts = n; }
 
@@ -82,6 +87,7 @@ private:
     bool      _isFirst;
     bool      _groundMode    = false;
     float     _maxStepDist   = 5.0f;   // 프레임당 최대 이동 거리 (m) — 초과 시 ICP 실패로 간주
+    float     _maxRange      = 80.0f;  // 입력 range 필터 (m). 초과 점 버림. 0=비활성
     IMUPreintegrator* _imu   = nullptr;
     ImuOdometry* _imuOdom    = nullptr;
 
@@ -104,4 +110,16 @@ private:
     float _lastFitness    = 0.0f;   // 마지막 프레임 GICP fitness
     bool  _lastAccepted   = false;  // 마지막 프레임이 정상 채택됐는가 (스킵이면 false)
     bool  _lastStationary = false;  // 마지막 프레임이 정지로 판정됐는가
+
+    // 속도 적응 로컬맵 반경: 느리면 좁게(국소 정밀), 빠르면 넓게(겹침 확보).
+    // 고정 20m는 fast motion에서 겹침 부족, 고정 50m는 slow에서 먼 점이 정합을 흐림.
+    // window = clamp(15 + |Δt|·80, 20, 55) — 프레임 이동량 기반.
+    float adaptiveWindow() const
+    {
+        float speed = std::sqrt(_lastDeltaT[0]*_lastDeltaT[0] +
+                                _lastDeltaT[1]*_lastDeltaT[1] +
+                                _lastDeltaT[2]*_lastDeltaT[2]);
+        float w = 15.0f + speed * 80.0f;
+        return w < 20.0f ? 20.0f : (w > 55.0f ? 55.0f : w);
+    }
 };

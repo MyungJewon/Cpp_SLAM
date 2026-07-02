@@ -72,6 +72,11 @@ void MapBuilder::rebuildFromPoses(const std::vector<Pose3D>& optimizedPoses)
 {
     _map.clear();
 
+    // 진단: 키프레임별 회전(rpy)·위치·점군 spread를 output/keyframes.log에 기록.
+    // "위치는 멀쩡한데 맵만 폭발"의 원인(회전 오염 vs 로컬점 폭주)을 특정하기 위함.
+    std::ofstream kfLog("output/keyframes.log");
+    kfLog << "# id  roll pitch yaw(deg)  tx ty tz  localMaxR  worldSpread\n";
+
     for (size_t id = 0; id < _keyFrameData.size(); ++id)
     {
         const auto& keyFrame = _keyFrameData[id];
@@ -82,15 +87,35 @@ void MapBuilder::rebuildFromPoses(const std::vector<Pose3D>& optimizedPoses)
         const auto& R = pose.R;
         const auto& t = pose.t;
 
+        // 회전을 roll/pitch/yaw(deg)로 (R = Rz*Ry*Rx 가정)
+        float pitch = std::asin(std::max(-1.0f, std::min(1.0f, -R[6])));
+        float roll  = std::atan2(R[7], R[8]);
+        float yaw   = std::atan2(R[3], R[0]);
+        const float RAD = 180.0f / 3.14159265f;
+
+        // 로컬 점군 최대 반경(원본 스캔 크기) + 변환 후 월드 spread(퍼짐)
+        float localMaxR = 0.0f;
+        float wminx=1e30f,wmaxx=-1e30f,wminy=1e30f,wmaxy=-1e30f,wminz=1e30f,wmaxz=-1e30f;
+
         _map.reserve(_map.size() + keyFrame.localPoints.size());
         for (const auto& p : keyFrame.localPoints)
         {
-            _map.push_back({
+            float lr = std::sqrt(p[0]*p[0]+p[1]*p[1]+p[2]*p[2]);
+            if (lr > localMaxR) localMaxR = lr;
+            std::array<float,3> w = {
                 R[0]*p[0] + R[1]*p[1] + R[2]*p[2] + t[0],
                 R[3]*p[0] + R[4]*p[1] + R[5]*p[2] + t[1],
                 R[6]*p[0] + R[7]*p[1] + R[8]*p[2] + t[2]
-            });
+            };
+            wminx=std::min(wminx,w[0]);wmaxx=std::max(wmaxx,w[0]);
+            wminy=std::min(wminy,w[1]);wmaxy=std::max(wmaxy,w[1]);
+            wminz=std::min(wminz,w[2]);wmaxz=std::max(wmaxz,w[2]);
+            _map.push_back(w);
         }
+        float spread = std::max(wmaxx-wminx, std::max(wmaxy-wminy, wmaxz-wminz));
+        kfLog << id << "  " << roll*RAD << " " << pitch*RAD << " " << yaw*RAD
+              << "  " << t[0] << " " << t[1] << " " << t[2]
+              << "  " << localMaxR << "  " << spread << "\n";
     }
 
     _map = voxelGridFilter(_map, _voxelSize);

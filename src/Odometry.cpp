@@ -137,23 +137,46 @@ void Odometry::addFrame(const std::vector<std::array<float, 3>>& rawPoints,
     _lastAccepted = false;
     _lastStationary = false;
 
-    const std::vector<std::array<float, 3>>* filterInput = &rawPoints;
-    std::vector<std::array<float, 3>> deskewed;
-
-    if (_imu && pointTimes && pointTimes->size() == rawPoints.size() && !pointTimes->empty())
+    // Range 필터: 센서에서 _maxRange(m) 초과 점을 버린다. 초장거리 점은 희박·노이즈라
+    // 정합엔 도움 안 되고 맵만 오염시킨다(예: data_3에서 스캔당 200m 점이 맵을 300m로 폭발).
+    // pointTimes와 정렬을 유지한다. _maxRange<=0이면 비활성.
+    const std::vector<std::array<float, 3>>* srcPts = &rawPoints;
+    const std::vector<float>* srcTimes = pointTimes;
+    std::vector<std::array<float, 3>> rangeBuf;
+    std::vector<float> timeBuf;
+    if (_maxRange > 0.0f)
     {
-        deskewed = rawPoints;
-        double scanDuration = (double)*std::max_element(pointTimes->begin(), pointTimes->end());
-        Matrix3x3 REnd = _imu->getRotationAt(scanDuration);
-        Matrix3x3 REndInv = transposeMat(REnd);
+        const float r2 = _maxRange * _maxRange;
+        const bool haveTimes = pointTimes && pointTimes->size() == rawPoints.size();
+        rangeBuf.reserve(rawPoints.size());
         for (size_t i = 0; i < rawPoints.size(); ++i)
         {
-            Matrix3x3 RAtTi = _imu->getRotationAt((double)(*pointTimes)[i]);
+            const auto& p = rawPoints[i];
+            if (p[0]*p[0] + p[1]*p[1] + p[2]*p[2] > r2) continue;
+            rangeBuf.push_back(p);
+            if (haveTimes) timeBuf.push_back((*pointTimes)[i]);
+        }
+        srcPts = &rangeBuf;
+        srcTimes = haveTimes ? &timeBuf : nullptr;
+    }
+
+    const std::vector<std::array<float, 3>>* filterInput = srcPts;
+    std::vector<std::array<float, 3>> deskewed;
+
+    if (_imu && srcTimes && srcTimes->size() == srcPts->size() && !srcTimes->empty())
+    {
+        deskewed = *srcPts;
+        double scanDuration = (double)*std::max_element(srcTimes->begin(), srcTimes->end());
+        Matrix3x3 REnd = _imu->getRotationAt(scanDuration);
+        Matrix3x3 REndInv = transposeMat(REnd);
+        for (size_t i = 0; i < srcPts->size(); ++i)
+        {
+            Matrix3x3 RAtTi = _imu->getRotationAt((double)(*srcTimes)[i]);
             // 점이 찍힌 시점의 자세를 스캔 종료 시점 자세로 맞춰 회전 왜곡을 줄입니다.
             // 회전 deskew는 자이로 기반이라 신뢰 가능. translational deskew는 IMU velocity가
             // 발산하면 점을 수 미터씩 밀어 점군을 망가뜨리므로(정합 fitness 붕괴) 사용하지 않는다.
             Matrix3x3 RRel = multiplyMat(REndInv, RAtTi);
-            deskewed[i] = multiplyVec(RRel, rawPoints[i]);
+            deskewed[i] = multiplyVec(RRel, (*srcPts)[i]);
         }
         filterInput = &deskewed;
     }
@@ -334,7 +357,7 @@ void Odometry::addFrame(const std::vector<std::array<float, 3>>& rawPoints,
             });
         }
         _localMap.insertAndUpdate(worldFrameStationary, _position);
-        _localMap.slideWindow(_position, 20.0f);
+        _localMap.slideWindow(_position, adaptiveWindow());
         _trajectory.push_back(_position);
         _lastFrame = currentFrame;
         _hasPrevDelta = false;  // 정지 후 재출발 시 stale velocity 예측 방지

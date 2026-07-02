@@ -1,5 +1,6 @@
 // Map Builder 구현: 각 프레임의 포인트를 전역 좌표로 변환해 누적 맵을 생성합니다.
 #include "MapBuilder.h"
+#include <cmath>
 #include <fstream>
 #include <iostream>
 
@@ -14,8 +15,9 @@ void MapBuilder::addFrame(const std::vector<std::array<float, 3>>& points,
                            const Matrix3x3&                         rotation,
                            const std::array<float, 3>&              position)
 {
-    // 1. 각 점을 전역 좌표로 변환
-    // 로컬 좌표 → 회전 적용 → 위치 이동 → 전역 좌표
+    // 각 점을 전역 좌표로 변환하며 증분 voxel 중복제거.
+    // 이미 점이 있는 voxel은 스킵 → 프레임당 O(신규 점).
+    // (기존: N프레임마다 전체 맵 voxelGridFilter = O(맵 크기), 맵이 클수록 급격히 느려짐)
     for (const auto& p : points)
     {
         std::array<float, 3> global = {
@@ -23,19 +25,24 @@ void MapBuilder::addFrame(const std::vector<std::array<float, 3>>& points,
             rotation[3]*p[0] + rotation[4]*p[1] + rotation[5]*p[2] + position[1],
             rotation[6]*p[0] + rotation[7]*p[1] + rotation[8]*p[2] + position[2]
         };
-        _map.push_back(global);
+        VoxelKey key{(int)std::floor(global[0] / _voxelSize),
+                     (int)std::floor(global[1] / _voxelSize),
+                     (int)std::floor(global[2] / _voxelSize)};
+        if (_occupied.insert(key).second)
+            _map.push_back(global);
     }
 
     ++_frameCount;
+}
 
-    // 2. 일정 프레임마다 Voxel Grid로 맵 정리
-    if (_frameCount % _cleanupInterval == 0)
-    {
-        int before = (int)_map.size();
-        _map = voxelGridFilter(_map, _voxelSize);
-        std::cout << "[MapBuilder] 맵 정리: " << before
-                  << " → " << _map.size() << "개 점" << std::endl;
-    }
+void MapBuilder::rebuildOccupied()
+{
+    _occupied.clear();
+    _occupied.reserve(_map.size() * 2);
+    for (const auto& p : _map)
+        _occupied.insert(VoxelKey{(int)std::floor(p[0] / _voxelSize),
+                                  (int)std::floor(p[1] / _voxelSize),
+                                  (int)std::floor(p[2] / _voxelSize)});
 }
 
 int MapBuilder::getPointCount() const
@@ -87,6 +94,7 @@ void MapBuilder::rebuildFromPoses(const std::vector<Pose3D>& optimizedPoses)
     }
 
     _map = voxelGridFilter(_map, _voxelSize);
+    rebuildOccupied();  // 재구성 후 증분 중복제거 상태 동기화
     _frameCount = (int)_keyFrameData.size();
     std::cout << "[MapBuilder] 포즈 그래프 결과로 맵 재구성: "
               << _map.size() << "개 점" << std::endl;

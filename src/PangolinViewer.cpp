@@ -66,6 +66,21 @@ void PangolinViewer::update(const std::vector<std::array<float,3>>& mapPoints,
     _dirty = true;
 }
 
+void PangolinViewer::updatePose(const std::vector<std::array<float,3>>& trajectory,
+                                const Matrix3x3& rotation,
+                                const std::array<float,3>& position,
+                                int frameIdx,
+                                float icpError)
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+    _trajectory = trajectory;
+    _rotation = rotation;
+    _position = position;
+    _frameIdx = frameIdx;
+    _icpError = icpError;
+    _dirty = true;
+}
+
 void PangolinViewer::setLoopEdges(
     const std::vector<std::pair<std::array<float,3>, std::array<float,3>>>& edges)
 {

@@ -3,8 +3,10 @@
 #include <array>
 #include <vector>
 #include <string>
+#include <unordered_set>
 #include "ICP.h"
 #include "VoxelGrid.h"
+#include "VoxelMap.h"  // VoxelKey/VoxelKeyHash (증분 중복제거용)
 #include "PoseGraph.h"
 
 struct KeyFrameData
@@ -50,4 +52,9 @@ private:
 
     std::vector<std::array<float, 3>> _map;
     std::vector<KeyFrameData> _keyFrameData;
+
+    // 증분 voxel 중복제거: 이미 점이 있는 voxel은 스킵 → 프레임당 O(신규 점).
+    // (기존: 주기적으로 전체 맵 voxelGridFilter = O(맵 크기), 맵이 클수록 느려짐)
+    std::unordered_set<VoxelKey, VoxelKeyHash> _occupied;
+    void rebuildOccupied();  // rebuildFromPoses 후 _map 기준으로 재구축
 };

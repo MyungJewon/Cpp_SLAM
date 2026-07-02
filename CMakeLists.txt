@@ -32,12 +32,12 @@ add_executable(slam
 )
 
 target_include_directories(slam PRIVATE src)
-target_compile_options(slam PRIVATE -O2 -Wall)
+target_compile_options(slam PRIVATE -O3 -Wall)
 
 # 오프라인 병합 도구 (GUI/Pangolin 불필요).
 add_executable(mapmerge src/mapmerge_main.cpp ${CORE_SOURCES})
 target_include_directories(mapmerge PRIVATE src)
-target_compile_options(mapmerge PRIVATE -O2 -Wall)
+target_compile_options(mapmerge PRIVATE -O3 -Wall)
 target_link_libraries(mapmerge gtsam)
 
 # 단위 테스트.

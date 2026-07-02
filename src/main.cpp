@@ -466,7 +466,12 @@ int main(int argc, char* argv[])
             }
 
             const Pose3D curGraphPose = poseGraph.getPose(poseGraph.getCurrentId());
-            viewer.update(bagMap.getMap(), displayTraj, curGraphPose.R, curGraphPose.t, frameIdx, 0.0f);
+            // 맵 전체 복사는 10프레임마다만 (매 프레임 수백만 바이트 memcpy 회피).
+            // 포즈/궤적은 매 프레임 갱신해 부드러운 추적 유지.
+            if (frameIdx % 10 == 0)
+                viewer.update(bagMap.getMap(), displayTraj, curGraphPose.R, curGraphPose.t, frameIdx, 0.0f);
+            else
+                viewer.updatePose(displayTraj, curGraphPose.R, curGraphPose.t, frameIdx, 0.0f);
 
             std::cout << "[SLAM] 프레임 " << frameIdx
                       << " | 점 개수: " << framePoints.size()

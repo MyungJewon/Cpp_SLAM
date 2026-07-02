@@ -47,7 +47,7 @@ PoseGraph 최적화 결과 ──→ MapBuilder ──→ output/slam_map.ply
 | `VoxelGrid` | Voxel Grid Filter (다운샘플링) |
 | `VoxelMap` | per-voxel mean/covariance/normal 관리, 고유값 상대 플로어 정규화 |
 | `KDTree` | 3D KD-Tree. ICP 대응점 탐색에 사용 |
-| `ICP` | Voxel-GICP. per-voxel Mahalanobis 가중치, point-to-plane fallback |
+| `ICP` | Voxel-GICP. per-voxel Mahalanobis 가중치, point-to-plane fallback. **대응점 탐색·공분산 추정 멀티스레드**(청크 순서 병합 → 결과 결정적) |
 | `IMUPreintegrator` | IMU 적분 (Rodrigues 공식). 회전 deskew와 gravity 측정 저장에 사용 |
 | `ImuOdometry` | (레거시) 별도 그래프 IMU 융합. pose override 방식이 점군을 망가뜨려 폐기, 현재 미사용 |
 | `Odometry` | Scan-to-Map 포즈 추정. Constant velocity 예측, sliding window 로컬 맵 |
@@ -60,7 +60,7 @@ PoseGraph 최적화 결과 ──→ MapBuilder ──→ output/slam_map.ply
 | `ScanContext` | 20링×60섹터 디스크립터. 위치 무관 장소 인식 + yaw 추정(bestShift). 멀티세션 병합 후보 검색에 사용 |
 | `Session` / `SessionIO` | 세션(서브맵 목록 + 메타) 표현 및 디스크 저장/로드 (서브맵별 PLY + poses.txt) |
 | `SessionMerger` | **멀티세션 병합 코어**. 전역 정렬(yaw 스윕 GICP) → ScanContext 후보/클러스터링 → GTSAM 통합 그래프 → 병합 점군. (대칭 구조에서 자동 정렬 불안정 — 아래 한계 참조) |
-| `MapBuilder` | 전역 점군 누적, keyframe 저장, PLY 저장 |
+| `MapBuilder` | 전역 점군 누적, keyframe 저장, PLY 저장. **증분 voxel 중복제거**(신규 점만 O(1) 삽입 — 주기적 전체 재필터 제거) |
 | `PangolinViewer` | 실시간 3D 시각화 + 루프 클로저 스냅/연결선, 종료 후 창 유지 |
 
 ### 실행 파일
@@ -349,6 +349,9 @@ python tools/eval_merge.py output/merged.ply reference.pcd
 - [x] Innovation gating + 적응형 Tikhonov damping (degenerate 방향 안정화)
 - [x] 정지 감지 (포즈 고정, 맵 갱신 유지)
 - [x] 성능 최적화 (k-NN 공분산 O(N log N))
+- [x] **멀티스레드 가속 + 실시간 처리** — GICP 대응점 탐색·공분산 추정 병렬화(std::thread),
+      MapBuilder 증분 voxel 중복제거(전체 재필터 제거), 뷰어 맵복사 스로틀, -O3.
+      → data_3(3021프레임) 234초 처리 = **~13fps, 녹화 시간보다 빠름**(실시간 초과)
 - [x] Pangolin 실시간 뷰어 (루프 스냅 + 연결선, 종료 후 창 유지)
 - [x] PLY / PPM / loops.log 출력
 - [x] **순수 LiDAR front-end 안정화** (360° 라이다 전 구간 끊김 없이 추적)
@@ -372,7 +375,7 @@ python tools/eval_merge.py output/merged.ply reference.pcd
 - [ ] **mapmerge 수동 초기 정렬 힌트** (`--init-yaw`, `--init-t`) — 대칭 구조 180° 모호성
       해결의 핵심. GLIM식으로 사용자가 대략 방향만 주면 GICP가 정밀화 (현재 최우선)
 - [ ] ScanContext 2차 루프 후보 검색 — 드리프트가 searchRadius(12m) 초과 시 루프 복구
-      (부품 검증 완료, 연결만 남음. `docs/성능_분석_및_개선방안.md` 참조)
+      (부품 검증 완료, 연결만 남음)
 - [ ] mapmerge 개선: 3개+ 세션 체인 정렬(현재 추가 세션은 세션0에만 정렬)
 - [ ] mapmerge용 CMake에서 Pangolin 의존 분리 (현재 configure 단계에서 Pangolin 요구)
 - [ ] BagParser 압축 chunk(lz4/bz2) 지원 (현재 none만)
@@ -380,7 +383,6 @@ python tools/eval_merge.py output/merged.ply reference.pcd
 
 > 참고: 기본 권장 구성은 **순수 LiDAR + 루프 클로저**(IMU off)입니다 — 360° 라이다에서 검증됨.
 > `--imu`는 안전하게 동작하나(폭주/크래시 없음) 맵 품질이 낮아 기본값이 아닙니다.
-> 상세 성능 분석과 개선 로드맵: `docs/성능_분석_및_개선방안.md`
 
 ---
 

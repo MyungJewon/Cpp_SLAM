@@ -23,6 +23,13 @@ public:
                 int frameIdx,
                 float icpError);
 
+    // 경량 갱신: 맵 복사 없이 궤적/포즈만 갱신 (매 프레임 전체 맵 복사 회피).
+    void updatePose(const std::vector<std::array<float,3>>& trajectory,
+                    const Matrix3x3& rotation,
+                    const std::array<float,3>& position,
+                    int frameIdx,
+                    float icpError);
+
     // 루프 클로저 연결선 (각 원소 = {fromAnchor 위치, toAnchor 위치}).
     // 어느 지점끼리 루프로 묶였는지 시각화한다.
     void setLoopEdges(const std::vector<std::pair<std::array<float,3>,

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <numeric>
 #include <limits>
+#include <thread>
 
 static Matrix3x3 multiplyMat(const Matrix3x3& A, const Matrix3x3& B)
 {
@@ -181,8 +182,17 @@ static std::vector<Matrix3x3> estimateCovariances(
     tree.build(pts);
 
     int neighborCount = std::max(3, std::min(k, (int)pts.size()));
-    for (const auto& p : pts)
+
+    // 점별 k-NN 공분산은 독립 → 병렬 처리 (KDTree 질의는 read-only라 thread-safe).
+    covariances.resize(pts.size());
+    unsigned hw = std::thread::hardware_concurrency();
+    int nT = (int)std::min(8u, hw ? hw : 1u);
+    if ((int)pts.size() < 4000) nT = 1;
+
+    auto covWorker = [&](size_t begin, size_t end) {
+    for (size_t pi = begin; pi < end; ++pi)
     {
+        const auto& p = pts[pi];
         std::vector<int> idx = tree.kNearestIdx(p, neighborCount);
         int cnt = (int)idx.size();
 
@@ -220,13 +230,24 @@ static std::vector<Matrix3x3> estimateCovariances(
         };
         Matrix3x3 Creg = {};
         for (int r = 0; r < 3; ++r)
-            for (int k = 0; k < 3; ++k)
+            for (int kk = 0; kk < 3; ++kk)
             {
                 float s = 0.0f;
-                for (int c = 0; c < 3; ++c) s += V[r*3+c] * lam[c] * V[k*3+c];
-                Creg[r*3+k] = s;
+                for (int c = 0; c < 3; ++c) s += V[r*3+c] * lam[c] * V[kk*3+c];
+                Creg[r*3+kk] = s;
             }
-        covariances.push_back(Creg);
+        covariances[pi] = Creg;
+    }
+    };
+
+    if (nT == 1) covWorker(0, pts.size());
+    else {
+        std::vector<std::thread> threads;
+        threads.reserve(nT);
+        for (int ti = 0; ti < nT; ++ti)
+            threads.emplace_back(covWorker, pts.size() * ti / nT,
+                                 pts.size() * (ti + 1) / nT);
+        for (auto& th : threads) th.join();
     }
 
     return covariances;
@@ -659,66 +680,100 @@ ICPResult runICP(const std::vector<std::array<float, 3>>& src,
         std::vector<Matrix3x3> matchedDstCovariances;
         float totalPointToPlaneSquaredError = 0.0f;
 
-        for (size_t pointIdx = 0; pointIdx < current.size(); ++pointIdx)
+        if (useGICP && voxelMap)
         {
-            const auto& p = current[pointIdx];
-            std::array<float, 3> nearest;
-            int nearestIdx = -1;
-            if (useGICP && voxelMap)
-            {
-                const VoxelCell* nearestCell = nullptr;
-                float nearestDistSq = std::numeric_limits<float>::max();
+            // ── 병렬 대응점 탐색 (프레임당 최대 병목: 점수×27복셀×반복수) ──
+            // 스레드별 버퍼에 모은 뒤 순서대로 병합 → 직렬과 동일 순서(결정적).
+            struct MatchBuf {
+                std::vector<std::array<float, 3>> src, dst;
+                std::vector<Matrix3x3> srcCov, dstCov;
+                float errSq = 0.0f;
+            };
+            unsigned hw = std::thread::hardware_concurrency();
+            int nT = (int)std::min(8u, hw ? hw : 1u);
+            if ((int)current.size() < 4000) nT = 1;  // 작은 프레임은 스레드 오버헤드 회피
 
-                int ix = (int)std::floor(p[0] / voxelSize);
-                int iy = (int)std::floor(p[1] / voxelSize);
-                int iz = (int)std::floor(p[2] / voxelSize);
+            std::vector<MatchBuf> bufs(nT);
+            auto worker = [&](int ti) {
+                MatchBuf& b = bufs[ti];
+                const size_t begin = current.size() * ti / nT;
+                const size_t end   = current.size() * (ti + 1) / nT;
+                b.src.reserve(end - begin);
+                for (size_t pointIdx = begin; pointIdx < end; ++pointIdx)
+                {
+                    const auto& p = current[pointIdx];
+                    const VoxelCell* nearestCell = nullptr;
+                    float nearestDistSq = std::numeric_limits<float>::max();
 
-                for (int dx = -1; dx <= 1; ++dx) {
-                    for (int dy = -1; dy <= 1; ++dy) {
-                        for (int dz = -1; dz <= 1; ++dz) {
-                            VoxelKey key{ix + dx, iy + dy, iz + dz};
-                            auto cellIt = voxelMap->find(key);
-                            if (cellIt == voxelMap->end()) continue;
+                    int ix = (int)std::floor(p[0] / voxelSize);
+                    int iy = (int)std::floor(p[1] / voxelSize);
+                    int iz = (int)std::floor(p[2] / voxelSize);
 
-                            const VoxelCell& cell = cellIt->second;
-                            // VGICP: 평면 게이트 대신 공분산이 신뢰 가능한(점 충분한) voxel을
-                            // 모두 사용. 기하 가중은 공분산 W가 알아서 처리한다.
-                            if (cell.point_count < kMinCovPoints) continue;
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        for (int dy = -1; dy <= 1; ++dy) {
+                            for (int dz = -1; dz <= 1; ++dz) {
+                                VoxelKey key{ix + dx, iy + dy, iz + dz};
+                                auto cellIt = voxelMap->find(key);
+                                if (cellIt == voxelMap->end()) continue;
 
-                            float cx = p[0] - cell.center[0];
-                            float cy = p[1] - cell.center[1];
-                            float cz = p[2] - cell.center[2];
-                            float distSq = cx*cx + cy*cy + cz*cz;
-                            if (distSq < nearestDistSq)
-                            {
-                                nearestDistSq = distSq;
-                                nearestCell = &cell;
+                                const VoxelCell& cell = cellIt->second;
+                                // VGICP: 공분산이 신뢰 가능한(점 충분한) voxel만 사용.
+                                if (cell.point_count < kMinCovPoints) continue;
+
+                                float cx = p[0] - cell.center[0];
+                                float cy = p[1] - cell.center[1];
+                                float cz = p[2] - cell.center[2];
+                                float distSq = cx*cx + cy*cy + cz*cz;
+                                if (distSq < nearestDistSq)
+                                {
+                                    nearestDistSq = distSq;
+                                    nearestCell = &cell;
+                                }
                             }
                         }
                     }
+
+                    if (!nearestCell || nearestDistSq > maxDistSq) continue;
+
+                    b.src.push_back(p);
+                    b.dst.push_back(nearestCell->center);
+                    b.srcCov.push_back(
+                        transformCovariance(result.R, srcCovariances[pointIdx]));
+                    b.dstCov.push_back(nearestCell->covariance);
+                    float residual = dotVec({p[0] - nearestCell->center[0],
+                                             p[1] - nearestCell->center[1],
+                                             p[2] - nearestCell->center[2]},
+                                            nearestCell->normal);
+                    b.errSq += residual * residual;
                 }
+            };
 
-                if (!nearestCell || nearestDistSq > maxDistSq) continue;
-
-                matchedSrc.push_back(p);
-                matchedDst.push_back(nearestCell->center);
-                matchedNormals.push_back(nearestCell->normal);
-                matchedSrcCovariances.push_back(
-                    transformCovariance(result.R, srcCovariances[pointIdx]));
-                matchedDstCovariances.push_back(nearestCell->covariance);
-                float residual = dotVec({p[0] - nearestCell->center[0],
-                                         p[1] - nearestCell->center[1],
-                                         p[2] - nearestCell->center[2]},
-                                        nearestCell->normal);
-                totalPointToPlaneSquaredError += residual * residual;
-                continue;
+            if (nT == 1) worker(0);
+            else {
+                std::vector<std::thread> threads;
+                threads.reserve(nT);
+                for (int ti = 0; ti < nT; ++ti) threads.emplace_back(worker, ti);
+                for (auto& th : threads) th.join();
             }
-            else
+
+            for (auto& b : bufs)
             {
-                nearestIdx = tree.nearestIdx(p);
-                if (nearestIdx < 0) continue;
-                nearest = dst[nearestIdx];
+                matchedSrc.insert(matchedSrc.end(), b.src.begin(), b.src.end());
+                matchedDst.insert(matchedDst.end(), b.dst.begin(), b.dst.end());
+                matchedSrcCovariances.insert(matchedSrcCovariances.end(),
+                                             b.srcCov.begin(), b.srcCov.end());
+                matchedDstCovariances.insert(matchedDstCovariances.end(),
+                                             b.dstCov.begin(), b.dstCov.end());
+                totalPointToPlaneSquaredError += b.errSq;
             }
+        }
+        else
+        for (size_t pointIdx = 0; pointIdx < current.size(); ++pointIdx)
+        {
+            const auto& p = current[pointIdx];
+            int nearestIdx = tree.nearestIdx(p);
+            if (nearestIdx < 0) continue;
+            const std::array<float, 3>& nearest = dst[nearestIdx];
 
             float dx = p[0] - nearest[0];
             float dy = p[1] - nearest[1];

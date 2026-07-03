@@ -25,9 +25,12 @@ void printUsage()
     std::cout << "사용법 (토픽 확인): ./slam --info <bag파일>" << std::endl;
     std::cout << "사용법 (SLAM):      ./slam <bag파일> <포인트토픽> <IMU토픽> [옵션]" << std::endl;
     std::cout << "  예) ./slam data.bag /velodyne_points /imu" << std::endl;
-    std::cout << "  옵션: --no-lc    루프 클로저 비활성화" << std::endl;
-    std::cout << "        --imu     IMU 타이트 커플링 활성화" << std::endl;
-    std::cout << "        --no-imu  IMU 타이트 커플링 비활성화 (기본값, 회전 디스큐잉만 사용)" << std::endl;
+    std::cout << "  옵션: --no-lc          루프 클로저 비활성화" << std::endl;
+    std::cout << "        --imu           IMU 타이트 커플링 활성화" << std::endl;
+    std::cout << "        --no-imu        IMU 타이트 커플링 비활성화 (기본값, 회전 디스큐잉만 사용)" << std::endl;
+    std::cout << "        --max-range <m> 입력 range 필터 (기본 80m, 0=무제한/센서 최대거리 다 사용)" << std::endl;
+    std::cout << "        --voxel <m>     front-end voxel 크기 (기본 0.2, 야외·희박은 0.4~0.5)" << std::endl;
+    std::cout << "        --save-session <dir>  멀티세션 병합용 세션 저장" << std::endl;
 }
 
 void saveTrajectoryPly(const std::vector<std::array<float, 3>>& traj,
@@ -236,6 +239,7 @@ int main(int argc, char* argv[])
     bool useImuOdom = false;
     std::string sessionDir;  // --save-session <dir>: 멀티세션 병합용 세션 저장
     float maxRange = 80.0f;   // --max-range: 입력 range 필터(m). 초장거리 노이즈 제거
+    float odomVoxel = 0.2f;   // --voxel: front-end voxel 크기(m). 실내 0.2 / 야외·희박 0.4~0.5
     std::vector<std::string> posArgs;
     for (int i = 1; i < argc; ++i)
     {
@@ -250,6 +254,8 @@ int main(int argc, char* argv[])
             sessionDir = argv[++i];
         else if (a == "--max-range" && i + 1 < argc)
             maxRange = std::stof(argv[++i]);
+        else if (a == "--voxel" && i + 1 < argc)
+            odomVoxel = std::stof(argv[++i]);
         else
             posArgs.push_back(a);
     }
@@ -273,7 +279,7 @@ int main(int argc, char* argv[])
     std::cout << "\n--- Bag Parser + SLAM ---" << std::endl;
 
     BagParser        bag(bagPath, pointsTopic, imuTopic);
-    Odometry         bagOdom(0.2f);
+    Odometry         bagOdom(odomVoxel);
     MapBuilder       bagMap(0.3f, 10);
     PoseGraph        poseGraph;
     IMUPreintegrator imu;

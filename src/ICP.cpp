@@ -632,7 +632,8 @@ ICPResult runICP(const std::vector<std::array<float, 3>>& src,
                  const std::unordered_map<VoxelKey, VoxelCell, VoxelKeyHash>* voxelMap,
                  float voxelSize,
                  const std::array<float, 3>* gravityBodyUp,
-                 float gravityScale)
+                 float gravityScale,
+                 float corrMaxDist)
 {
     (void)tolerance;
 
@@ -666,8 +667,15 @@ ICPResult runICP(const std::vector<std::array<float, 3>>& src,
         result.t = t0;
     }
 
-    const float gicpMaxDist = std::max(0.5f, voxelSize * 1.25f);
-    const float maxDistSq = useGICP ? gicpMaxDist * gicpMaxDist : 0.35f * 0.35f;
+    float gicpMaxDist = std::max(0.5f, voxelSize * 1.25f);
+    float p2pMaxDist  = 0.35f;
+    if (corrMaxDist > 0.0f)
+    {
+        // 속도 적응 대응 반경: 예측이 빗나가는 빠른 구간에서 대응 회복.
+        gicpMaxDist = std::max(gicpMaxDist, corrMaxDist);
+        p2pMaxDist  = std::max(p2pMaxDist,  corrMaxDist);
+    }
+    const float maxDistSq = useGICP ? gicpMaxDist * gicpMaxDist : p2pMaxDist * p2pMaxDist;
     // 공분산이 신뢰 가능할 최소 점수 (is_planar 게이트 대체)
     const int kMinCovPoints = 6;
 

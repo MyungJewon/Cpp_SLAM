@@ -50,7 +50,7 @@ PoseGraph 최적화 결과 ──→ MapBuilder ──→ output/slam_map.ply
 | `ICP` | Voxel-GICP. per-voxel Mahalanobis 가중치, point-to-plane fallback. **대응점 탐색·공분산 추정 멀티스레드**(청크 순서 병합 → 결과 결정적) |
 | `IMUPreintegrator` | IMU 적분 (Rodrigues 공식). 회전 deskew와 gravity 측정 저장에 사용 |
 | `ImuOdometry` | (레거시) 별도 그래프 IMU 융합. pose override 방식이 점군을 망가뜨려 폐기, 현재 미사용 |
-| `Odometry` | Scan-to-Map 포즈 추정. Constant velocity 예측, sliding window 로컬 맵 |
+| `Odometry` | Scan-to-Map 포즈 추정. Constant velocity 예측, **속도 적응**(로컬맵·대응 반경·예측유지) + 입력 range 필터. 가변 속도(도보~고속) 대응 |
 | `PoseMath` | Pose3D 변환 수학 (compose/invert/relative). 실시간·오프라인 공용 |
 | `Submap` | 점군 덩어리 + 앵커 pose + AABB. 키프레임 누적 결과 / 향후 PLY 1장 |
 | `SubmapBuilder` | 키프레임을 앵커 로컬 좌표계로 누적해 Submap 생성 |
@@ -104,14 +104,25 @@ KDTree k-NN 으로 source 점별 공분산을 O(N log N)에 추정 (brute-force 
 
 ```
 매 프레임:
+  0. Range 필터: 센서에서 max-range(기본 80m, 0=무제한) 초과 점 제거 — 먼 노이즈 방어
   1. Constant velocity 예측: predictedT = position + lastDeltaT
   2. 예측값으로 ICP 초기화
-  3. GICP 실행 (sliding window 로컬 맵 대상, 반경 50m)
+  3. GICP 실행 (sliding window 로컬 맵. 반경은 속도 적응: clamp(15+speed·80, 20, 55)m)
+     - 대응 반경도 속도 적응: speed>0.3 시 speed·1.5 (최대 5m)로 확장
   4. Innovation gating: 예측 대비 편차 > max(2.0, predStep*3.0) AND fitness < 0.15 → 거부
   5. maxStepDist(3.5m) 초과 → 거부
   6. 정지 감지(0.03m 미만) → 포즈 고정, 맵만 업데이트
-  7. 수락된 프레임만 delta 갱신 및 맵 삽입
+  7. 스킵(품질부족/게이팅) 시 예측을 리셋하지 않고 90% 감쇠 유지 → 빠른 구간 재정합 복구
+  8. GICP 전멸 시 point-to-point 폴백(KDTree 전역 탐색, 속도 비례 반경) — 빠른 구간 복구 경로
+  9. 수락된 프레임만 delta 갱신 및 맵 삽입
 ```
+
+> **속도 적응 설계 (가변 속도 대응):** 로컬맵 반경·대응 반경·예측 유지가 모두 프레임
+> 이동량에 연동됩니다. 느린 구간(도보)은 기존 동작 유지(회귀 없음), 빠른 구간(차량·고속도로)은
+> 자동으로 넓혀 추적을 유지합니다. 실측: freeway 데이터에서 30m 왕복 실패 → 800m+ 전진 성공,
+> 도보 데이터는 루프 30개·fitness 0.85 그대로 유지.
+> 단 개방 고속도로의 전진 방향 degeneracy(자기유사 구조)는 근본적으로 어려워, 중간 헤맴 후
+> 복구하는 수준입니다(완전한 highway odometry는 IMU/휠/GNSS 융합 필요).
 
 ### 루프 클로저 (GLIM식 서브맵 기반)
 
@@ -278,6 +289,11 @@ build/slam data.bag /velodyne_points /imu/data --no-lc
 # IMU 타이트커플링 실험 경로 활성화
 build/slam data.bag /velodyne_points /imu/data --imu
 
+# 입력 range 필터 / voxel 크기 조절
+#   --max-range : 기본 80m. 0을 주면 무제한(센서 최대 거리 전부 사용) — 야외·장거리용
+#   --voxel     : 기본 0.2m(실내). 야외·희박 점군은 0.4~0.5 권장
+build/slam outdoor.bag /os_cloud_node/points /os_cloud_node/imu --max-range 0 --voxel 0.5
+
 # 멀티세션 병합용 세션 저장
 build/slam bag1.bag /livox/lidar /livox/imu --save-session sessions/s1
 build/slam bag2.bag /livox/lidar /livox/imu --save-session sessions/s2
@@ -315,9 +331,8 @@ python tools/eval_merge.py output/merged.ply reference.pcd
 
 | SLAM 과정 영상 | 3D 맵핑 결과 (Pangolin 시각화 / 전역 맵) |
 | :---: | :---: |
-| <img src=https://github.com/user-attachments/assets/ab55ab66-a462-4be4-aa7a-2f71b51d2100 width="400" > | <img src="<img width="1348" height="820" alt="스크린샷 2026-07-02 오후 4 52 07" src="https://github.com/user-attachments/assets/db2abb2f-7f5c-4d3e-8834-d347c3767aae" />
- width="400" alt="3D SLAM 결과 맵"> |
-| *테스트에 사용된 센서 구성 및 주행 환경* | *Pangolin 뷰어 실시간 시각화 및 루프 클로저 연결선* |
+| <video src="https://github.com/user-attachments/assets/ab55ab66-a462-4be4-aa7a-2f71b51d2100" width="400" controls></video> | <img src="https://github.com/user-attachments/assets/db2abb2f-7f5c-4d3e-8834-d347c3767aae" width="400" alt="3D SLAM 결과 맵"> |
+| *테스트에 사용된 지하 주차장 데이터* | *Pangolin 뷰어 실시간 시각화 및 루프 클로저 연결선* |
 
 ---
 
@@ -380,6 +395,10 @@ python tools/eval_merge.py output/merged.ply reference.pcd
     순수 LiDAR 확정 우세. 재개 조건: LiDAR가 실제 열화되는 데이터 확보 시
 - [x] fitness 적응 odometry 노이즈 + 스킵 프레임 IMU 브릿지 + ZUPT (PoseGraph/Odometry)
 - [x] slideWindow 불일치 버그 수정 (메인 경로 50→20m 통일)
+- [x] **가변 속도 대응 (도보~고속도로)** — 로컬맵·대응 반경 속도 적응, 스킵 시 예측 유지(감쇠),
+      P2P 폴백 속도 비례 반경. freeway 800m+ 전진 성공, 도보 회귀 없음
+- [x] **입력 range 필터** (`--max-range`, 기본 80m / 0=무제한) — 초장거리 노이즈 맵 오염 방지
+- [x] **`--voxel` 플래그** — front-end voxel 실행 시 조절 (실내 0.2 / 야외 0.4~0.5)
 
 ### 진행 중 / 향후 과제
 - [ ] **mapmerge 수동 초기 정렬 힌트** (`--init-yaw`, `--init-t`) — 대칭 구조 180° 모호성

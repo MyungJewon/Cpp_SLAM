@@ -39,4 +39,8 @@ ICPResult runICP(const std::vector<std::array<float, 3>>& src,
                  // result.R * gravityBodyUp 가 월드 up(0,0,1)에 맞도록 roll/pitch를
                  // soft constraint로 구속 (yaw는 자유). GICP 경로에서만 적용.
                  const std::array<float, 3>* gravityBodyUp = nullptr,
-                 float            gravityScale = 0.0f);
+                 float            gravityScale = 0.0f,
+                 // 대응점 최대 거리 오버라이드(m). 0이면 기본값
+                 // (GICP: max(0.5, voxel×1.25) / P2P: 0.35). 빠른 이동 시 예측 오차만큼
+                 // 넓혀 대응을 회복한다 (P2P 폴백은 KDTree 전역 탐색이라 실효 큼).
+                 float            corrMaxDist = 0.0f);

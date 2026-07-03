@@ -246,14 +246,27 @@ void Odometry::addFrame(const std::vector<std::array<float, 3>>& rawPoints,
         localMapVec.push_back(kv.second.center);
     const std::array<float, 3>* gravityArg =
         (hasGravity && _gravityScale > 0.0f) ? &gravityUp : nullptr;
+
+    // 속도 적응 대응 반경: 빠른 이동일수록 예측 오차가 커지므로 대응 탐색을 넓힌다.
+    // 느린 구간(speed~0.1m/f)은 0 → 기본값 유지(실내 회귀 없음).
+    const float frameSpeed = std::sqrt(_lastDeltaT[0]*_lastDeltaT[0] +
+                                       _lastDeltaT[1]*_lastDeltaT[1] +
+                                       _lastDeltaT[2]*_lastDeltaT[2]);
+    const float corrDist = (frameSpeed > 0.3f)
+        ? std::min(5.0f, frameSpeed * 1.5f) : 0.0f;
+
     ICPResult icp = runICP(currentFrame, localMapVec, 20, 1e-4f,
                            initialR, initialT, false, true,
                            &_localMap.cells(), _voxelSize,
-                           gravityArg, _gravityScale);
+                           gravityArg, _gravityScale, corrDist);
     if (icp.fitness <= 0.0f && !localMapVec.empty())
     {
+        // P2P 폴백은 KDTree 전역 탐색이라 넓은 대응 반경이 실제로 통한다 —
+        // 빠른 구간에서 GICP(voxel 인접 탐색)가 놓친 정합을 재획득하는 복구 경로.
+        const float rescueDist = std::max(0.7f, std::min(5.0f, frameSpeed * 3.0f));
         icp = runICP(currentFrame, localMapVec, 20, 1e-4f,
-                     initialR, initialT, false, false);
+                     initialR, initialT, false, false,
+                     nullptr, 0.3f, nullptr, 0.0f, rescueDist);
     }
 
     if (!std::isfinite(icp.error) || icp.fitness < 0.08f ||
@@ -265,7 +278,10 @@ void Odometry::addFrame(const std::vector<std::array<float, 3>>& rawPoints,
         if (_imuOdom) _imuOdom->resetIntegration();
         _trajectory.push_back(_position);
         _lastFrame = currentFrame;
-        _hasPrevDelta = false;
+        // 예측 유지(감쇠): 리셋하면 다음 프레임 예측이 0이 되어 빠른 이동 중
+        // 실제 위치와 더 벌어짐 → 연쇄 스킵(죽음의 나선). 직전 속도의 90%로
+        // 계속 예측해 재정합 기회를 준다.
+        _lastDeltaT[0] *= 0.9f; _lastDeltaT[1] *= 0.9f; _lastDeltaT[2] *= 0.9f;
         return;
     }
 
@@ -281,7 +297,7 @@ void Odometry::addFrame(const std::vector<std::array<float, 3>>& rawPoints,
         if (_imuOdom) _imuOdom->resetIntegration();
         _trajectory.push_back(_position);
         _lastFrame = currentFrame;
-        _hasPrevDelta = false;
+        _lastDeltaT[0] *= 0.9f; _lastDeltaT[1] *= 0.9f; _lastDeltaT[2] *= 0.9f;  // 예측 유지(감쇠)
         return;
     }
 

@@ -331,7 +331,7 @@ python tools/eval_merge.py output/merged.ply reference.pcd
 
 | SLAM 과정 영상 | 3D 맵핑 결과 (Pangolin 시각화 / 전역 맵) |
 | :---: | :---: |
-| <video src="https://github.com/user-attachments/assets/ab55ab66-a462-4be4-aa7a-2f71b51d2100" width="400" controls></video> | <img src="https://github.com/user-attachments/assets/db2abb2f-7f5c-4d3e-8834-d347c3767aae" width="400" alt="3D SLAM 결과 맵"> |
+| <video src="https://github.com/user-attachments/assets/03f98008-530e-475b-a142-b6455bc9109b" width="400" controls></video> | <img src="https://github.com/user-attachments/assets/db2abb2f-7f5c-4d3e-8834-d347c3767aae" width="400" alt="3D SLAM 결과 맵"> |
 | *테스트에 사용된 지하 주차장 데이터* | *Pangolin 뷰어 실시간 시각화 및 루프 클로저 연결선* |
 
 ---

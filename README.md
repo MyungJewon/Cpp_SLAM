@@ -55,7 +55,7 @@ PoseGraph 최적화 결과 ──→ MapBuilder ──→ output/slam_map.ply
 | `Submap` | 점군 덩어리 + 앵커 pose + AABB. 키프레임 누적 결과 / 향후 PLY 1장 |
 | `SubmapBuilder` | 키프레임을 앵커 로컬 좌표계로 누적해 Submap 생성 |
 | `SubmapRegistration` | **재사용 정합 코어**. 두 Submap을 coarse-to-fine GICP로 정합 (실시간 루프 + 향후 PLY 병합 공용) |
-| `LoopCloser` | GLIM식 서브맵 기반 연속 루프 클로저. 위치 후보 → AABB → 정합 → overlap 게이트 |
+| `LoopCloser` | GLIM식 서브맵 연속 루프 클로저. **2단 검색**: 위치 후보(1순위) → ScanContext 형태 폴백(2순위, 강화 게이트) → AABB → 정합 → overlap 게이트 |
 | `PoseGraph` | GTSAM iSAM2 pose graph. odometry + 신뢰도 가중 루프 BetweenFactor. `--imu` 시 X/V/B 노드 + CombinedImuFactor 통합(LIO-SAM식, 실험적) |
 | `ScanContext` | 20링×60섹터 디스크립터. 위치 무관 장소 인식 + yaw 추정(bestShift). 멀티세션 병합 후보 검색에 사용 |
 | `Session` / `SessionIO` | 세션(서브맵 목록 + 메타) 표현 및 디스크 저장/로드 (서브맵별 PLY + poses.txt) |
@@ -134,8 +134,11 @@ KDTree k-NN 으로 source 점별 공분산을 O(N log N)에 추정 (brute-force 
    - 각 키프레임 센서-로컬 점 → 앵커 노드 로컬 좌표계로 변환 누적 (0.15m 다운샘플)
    - 점군은 앵커 센서 기준 상대 기하 → front-end/graph 프레임 발산과 무관하게 정확
 
-2. LoopCloser: 새 Submap마다
-   - 후보: 현재 추정 위치 반경 12m 내 + 노드 간격 200 이상 과거 Submap
+2. LoopCloser: 새 Submap마다 — 2단 후보 검색
+   [1순위: 위치 기반] 현재 추정 위치 반경 12m 내 + 노드 간격 200 이상 과거 Submap
+   [2순위: ScanContext 폴백] 1순위가 루프 0건일 때만 —
+     형태 디스크립터로 위치 무관 후보 검색 (드리프트 > 반경이어도 루프 복구)
+     · scanContextDistance ≤ 0.5 인 top-K, bestShift로 yaw 초기추정
    - AABB 1차 필터 → SubmapRegistration
    - 채택 시 PoseGraph에 BetweenFactor(past앵커 → new앵커) 추가
      · 측정 상대 pose = inv(T_past)·T_new = registerSubmaps 결과 (역변환 없음)
@@ -143,9 +146,13 @@ KDTree k-NN 으로 source 점별 공분산을 O(N log N)에 추정 (brute-force 
 
 3. SubmapRegistration (재사용 코어):
    - dst Submap으로 VoxelMap 구성 → coarse-to-fine GICP (1.0m → 0.5m)
-   - 게이트: fitness ≥ 0.25, overlap ≥ 0.4, rmse ≤ 0.5
+   - 게이트(위치 경로): fitness ≥ 0.25, overlap ≥ 0.4, rmse ≤ 0.5
      · overlap이 진짜/가짜 루프의 주 판별자 (진짜 0.5+, 가짜 0.1-)
-     · fitness는 voxel 6점 게이트 때문에 더 빡빡 → floor로만 사용
+   - 게이트(SC 폴백 경로, 강화): fitness ≥ 0.35, overlap ≥ 0.55
+     · 위치 사전정보 없이 들어오는 루프라 보수적으로. 실측 근거:
+       진짜 재방문 overlap 0.6~0.93 vs perceptual alias 0.43~0.57 → 그 사이를 컷
+     · 실전 검증: 16m 떨어진 alias(ov 0.43)가 기본 게이트는 통과했을 상황에서
+       강화 게이트에 정확히 기각됨 (loops.log의 cand(SC) 기록)
 ```
 
 보정은 PoseGraph에만 누적하고 front-end(Odometry) 내부 상태는 건드리지 않습니다.
@@ -397,14 +404,15 @@ python tools/eval_merge.py output/merged.ply reference.pcd
 - [x] slideWindow 불일치 버그 수정 (메인 경로 50→20m 통일)
 - [x] **가변 속도 대응 (도보~고속도로)** — 로컬맵·대응 반경 속도 적응, 스킵 시 예측 유지(감쇠),
       P2P 폴백 속도 비례 반경. freeway 800m+ 전진 성공, 도보 회귀 없음
+- [x] **ScanContext 2차 루프 검색** — 위치 검색 실패 시 형태 디스크립터로 위치 무관 후보 복구.
+      SC 경로엔 강화 게이트(ov≥0.55/fit≥0.35) — perceptual alias(실측 0.43~0.57)와
+      진짜 재방문(0.6+)의 경계로 컷. 실전에서 16m alias 차단 확인, 도보 데이터 회귀 없음
 - [x] **입력 range 필터** (`--max-range`, 기본 80m / 0=무제한) — 초장거리 노이즈 맵 오염 방지
 - [x] **`--voxel` 플래그** — front-end voxel 실행 시 조절 (실내 0.2 / 야외 0.4~0.5)
 
 ### 진행 중 / 향후 과제
 - [ ] **mapmerge 수동 초기 정렬 힌트** (`--init-yaw`, `--init-t`) — 대칭 구조 180° 모호성
       해결의 핵심. GLIM식으로 사용자가 대략 방향만 주면 GICP가 정밀화 (현재 최우선)
-- [ ] ScanContext 2차 루프 후보 검색 — 드리프트가 searchRadius(12m) 초과 시 루프 복구
-      (부품 검증 완료, 연결만 남음)
 - [ ] mapmerge 개선: 3개+ 세션 체인 정렬(현재 추가 세션은 세션0에만 정렬)
 - [ ] mapmerge용 CMake에서 Pangolin 의존 분리 (현재 configure 단계에서 Pangolin 요구)
 - [ ] BagParser 압축 chunk(lz4/bz2) 지원 (현재 none만)

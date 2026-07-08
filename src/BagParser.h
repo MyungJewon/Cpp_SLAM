@@ -35,12 +35,16 @@ public:
 
     int getFrameCount() const { return _frameCount; }
 
+    // 직전 nextFrame()이 반환한 라이다 프레임의 헤더 타임스탬프 (epoch 초)
+    double getLastFrameTime() const { return _lastFrameTime; }
+
 private:
     std::string   _bagPath;
     std::string   _pointsTopic;
     std::string   _imuTopic;
     std::ifstream _file;
     int           _frameCount   = 0;
+    double        _lastFrameTime = 0.0;  // 직전 프레임 헤더 stamp (TUM 궤적용)
     int           _connId       = -1;    // 라이다 토픽 connection ID
     int           _imuConnId    = -1;    // IMU 토픽 connection ID
 

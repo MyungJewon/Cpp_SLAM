@@ -464,8 +464,11 @@ bool BagParser::parsePointCloud2(const std::vector<uint8_t>& data,
 
     // Header (seq, stamp.sec, stamp.nsec, frame_id)
     readU32();         // seq
-    readU32();         // stamp.sec
-    readU32();         // stamp.nsec
+    {
+        uint32_t sec  = readU32();
+        uint32_t nsec = readU32();
+        _lastFrameTime = (double)sec + (double)nsec * 1e-9;
+    }
     readString();      // frame_id
 
     // height, width
@@ -686,7 +689,11 @@ bool BagParser::parseLivoxCustomMsg(const std::vector<uint8_t>& data,
 
     // Header
     readU32();                          // seq
-    readU32(); readU32();               // stamp sec, nsec
+    {
+        uint32_t sec  = readU32();
+        uint32_t nsec = readU32();
+        _lastFrameTime = (double)sec + (double)nsec * 1e-9;
+    }
     uint32_t frameIdLen = readU32();
     if (offset + frameIdLen > data.size()) return false;
     offset += frameIdLen;               // frame_id

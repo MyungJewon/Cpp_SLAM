@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -54,6 +55,62 @@ void saveTrajectoryPly(const std::vector<std::array<float, 3>>& traj,
     }
     std::cout << "[Visualizer] 경로 PLY 저장: " << path
               << " (" << n << "개 점)" << std::endl;
+}
+
+// 최적화된 포즈를 TUM 포맷(t x y z qx qy qz qw)으로 저장 —
+// VSLAM_repository 등 외부 파이프라인이 PoseProvider로 바로 읽는 연동 포트.
+void saveTrajectoryTum(const std::vector<Pose3D>& poses,
+                       const std::vector<double>& times,
+                       const std::string& path)
+{
+    std::ofstream f(path);
+    f << "# timestamp tx ty tz qx qy qz qw\n";
+    f << std::fixed << std::setprecision(6);
+    const size_t n = std::min(poses.size(), times.size());
+    for (size_t i = 0; i < n; ++i)
+    {
+        const Matrix3x3& R = poses[i].R;
+        // 회전행렬 → 쿼터니언 (Shepperd — 최대 대각 성분 기준으로 수치 안정)
+        float qw, qx, qy, qz;
+        const float tr = R[0] + R[4] + R[8];
+        if (tr > 0.0f)
+        {
+            float s = std::sqrt(tr + 1.0f) * 2.0f;
+            qw = 0.25f * s;
+            qx = (R[7] - R[5]) / s;
+            qy = (R[2] - R[6]) / s;
+            qz = (R[3] - R[1]) / s;
+        }
+        else if (R[0] > R[4] && R[0] > R[8])
+        {
+            float s = std::sqrt(1.0f + R[0] - R[4] - R[8]) * 2.0f;
+            qw = (R[7] - R[5]) / s;
+            qx = 0.25f * s;
+            qy = (R[1] + R[3]) / s;
+            qz = (R[2] + R[6]) / s;
+        }
+        else if (R[4] > R[8])
+        {
+            float s = std::sqrt(1.0f + R[4] - R[0] - R[8]) * 2.0f;
+            qw = (R[2] - R[6]) / s;
+            qx = (R[1] + R[3]) / s;
+            qy = 0.25f * s;
+            qz = (R[5] + R[7]) / s;
+        }
+        else
+        {
+            float s = std::sqrt(1.0f + R[8] - R[0] - R[4]) * 2.0f;
+            qw = (R[3] - R[1]) / s;
+            qx = (R[2] + R[6]) / s;
+            qy = (R[5] + R[7]) / s;
+            qz = 0.25f * s;
+        }
+        f << times[i] << " "
+          << poses[i].t[0] << " " << poses[i].t[1] << " " << poses[i].t[2]
+          << " " << qx << " " << qy << " " << qz << " " << qw << "\n";
+    }
+    std::cout << "[SLAM] TUM 궤적 저장: " << path << " (" << n << "개 포즈)"
+              << std::endl;
 }
 
 // 두 점 사이를 직선으로 그려서 buf에 색을 입힘 (DDA 알고리즘)
@@ -334,6 +391,7 @@ int main(int argc, char* argv[])
 
     std::vector<std::array<float, 3>> framePoints;
     std::vector<float> pointTimes;
+    std::vector<double> frameTimes;   // 포즈그래프 노드별 라이다 stamp (TUM 궤적용)
     int frameIdx = 0;
     bool imuCalibrationLogged = false;
 
@@ -414,6 +472,7 @@ int main(int argc, char* argv[])
                 }
                 poseGraph.addOdometry(delta, nullptr, lidarFit, stationary);
             }
+            frameTimes.push_back(bag.getLastFrameTime());  // 노드와 1:1 정렬
             prevPose = currentPose;
 
             auto pos = currentPose.t;
@@ -532,6 +591,9 @@ int main(int argc, char* argv[])
 
         bagMap.saveToPly(outputDir + "slam_map.ply");
         saveTrajectoryPly(bagOdom.getTrajectory(), outputDir + "slam_trajectory.ply");
+        if (poseGraph.getCurrentId() > 0)
+            saveTrajectoryTum(poseGraph.getAllPoses(), frameTimes,
+                              outputDir + "slam_trajectory.tum");
         saveMapImage(bagOdom.getTrajectory(), bagMap.getMap(), outputDir + "slam_map_2d.ppm", loopEdges);
 
         std::cout << "\n--- SLAM 결과 ---" << std::endl;

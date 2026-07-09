@@ -32,6 +32,8 @@ void printUsage()
     std::cout << "        --max-range <m> 입력 range 필터 (기본 80m, 0=무제한/센서 최대거리 다 사용)" << std::endl;
     std::cout << "        --voxel <m>     front-end voxel 크기 (기본 0.2, 야외·희박은 0.4~0.5)" << std::endl;
     std::cout << "        --save-session <dir>  멀티세션 병합용 세션 저장" << std::endl;
+    std::cout << "        --imu-rot <qx,qy,qz,qw>  IMU→LiDAR 외부파라미터 회전" << std::endl;
+    std::cout << "                        (캘리브의 lidar extrinsics quat. 내장 IMU가 아닐 때 필수)" << std::endl;
 }
 
 void saveTrajectoryPly(const std::vector<std::array<float, 3>>& traj,
@@ -295,6 +297,7 @@ int main(int argc, char* argv[])
     bool useLoopClosure = true;
     bool useImuOdom = false;
     std::string sessionDir;  // --save-session <dir>: 멀티세션 병합용 세션 저장
+    std::string imuRotStr;   // --imu-rot qx,qy,qz,qw: IMU→LiDAR 외부파라미터 회전
     float maxRange = 80.0f;   // --max-range: 입력 range 필터(m). 초장거리 노이즈 제거
     float odomVoxel = 0.2f;   // --voxel: front-end voxel 크기(m). 실내 0.2 / 야외·희박 0.4~0.5
     std::vector<std::string> posArgs;
@@ -309,6 +312,8 @@ int main(int argc, char* argv[])
             useImuOdom = false;
         else if (a == "--save-session" && i + 1 < argc)
             sessionDir = argv[++i];
+        else if (a == "--imu-rot" && i + 1 < argc)
+            imuRotStr = argv[++i];
         else if (a == "--max-range" && i + 1 < argc)
             maxRange = std::stof(argv[++i]);
         else if (a == "--voxel" && i + 1 < argc)
@@ -336,6 +341,21 @@ int main(int argc, char* argv[])
     std::cout << "\n--- Bag Parser + SLAM ---" << std::endl;
 
     BagParser        bag(bagPath, pointsTopic, imuTopic);
+    if (!imuRotStr.empty())
+    {
+        // "qx,qy,qz,qw" — 캘리브의 라이다 extrinsics(parent: imu) 쿼터니언 그대로
+        double q[4] = {0, 0, 0, 1};
+        if (std::sscanf(imuRotStr.c_str(), "%lf,%lf,%lf,%lf",
+                        &q[0], &q[1], &q[2], &q[3]) == 4)
+        {
+            bag.setImuRotation(q[0], q[1], q[2], q[3]);
+            std::cout << "  IMU 외부회전    : quat(xyzw) " << imuRotStr
+                      << " 적용 (IMU축→LiDAR축)" << std::endl;
+        }
+        else
+            std::cout << "[경고] --imu-rot 형식 오류 (qx,qy,qz,qw): "
+                      << imuRotStr << std::endl;
+    }
     Odometry         bagOdom(odomVoxel);
     MapBuilder       bagMap(0.3f, 10);
     PoseGraph        poseGraph;

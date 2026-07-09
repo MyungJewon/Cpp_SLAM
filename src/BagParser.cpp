@@ -1,5 +1,6 @@
 // ROS1 bag 파서 구현: /points 토픽에서 프레임별 포인트 클라우드를 추출합니다.
 #include "BagParser.h"
+#include <cmath>
 #include <iostream>
 #include <cstring>
 #include <unordered_map>
@@ -622,7 +623,37 @@ bool BagParser::parseImu(const std::vector<uint8_t>& data, ImuSample& sample)
     sample.linearAcceleration[1] = readF64();
     sample.linearAcceleration[2] = readF64();
 
+    // IMU→LiDAR 외부파라미터 회전 (내장 IMU가 아닌 장비: 축 정렬)
+    if (_hasImuRot)
+    {
+        auto rot = [&](std::array<double, 3>& v) {
+            const double x = v[0], y = v[1], z = v[2];
+            v[0] = _imuRot[0]*x + _imuRot[1]*y + _imuRot[2]*z;
+            v[1] = _imuRot[3]*x + _imuRot[4]*y + _imuRot[5]*z;
+            v[2] = _imuRot[6]*x + _imuRot[7]*y + _imuRot[8]*z;
+        };
+        rot(sample.angularVelocity);
+        rot(sample.linearAcceleration);
+    }
+
     return parseOk && offset <= data.size();
+}
+
+void BagParser::setImuRotation(double qx, double qy, double qz, double qw)
+{
+    // quat(xyzw) = R_imu_lidar → 벡터 변환에는 역회전 R_lidar_imu = Rᵀ 사용
+    const double n = std::sqrt(qx*qx + qy*qy + qz*qz + qw*qw);
+    qx /= n; qy /= n; qz /= n; qw /= n;
+    // R_imu_lidar (row-major)
+    const double R[9] = {
+        1 - 2*(qy*qy + qz*qz), 2*(qx*qy - qz*qw),     2*(qx*qz + qy*qw),
+        2*(qx*qy + qz*qw),     1 - 2*(qx*qx + qz*qz), 2*(qy*qz - qx*qw),
+        2*(qx*qz - qy*qw),     2*(qy*qz + qx*qw),     1 - 2*(qx*qx + qy*qy)};
+    // 전치 = R_lidar_imu
+    _imuRot[0] = R[0]; _imuRot[1] = R[3]; _imuRot[2] = R[6];
+    _imuRot[3] = R[1]; _imuRot[4] = R[4]; _imuRot[5] = R[7];
+    _imuRot[6] = R[2]; _imuRot[7] = R[5]; _imuRot[8] = R[8];
+    _hasImuRot = true;
 }
 
 // ── parseFrame: 타입에 따라 파서 분기 ───────────────

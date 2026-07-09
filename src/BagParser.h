@@ -38,6 +38,11 @@ public:
     // 직전 nextFrame()이 반환한 라이다 프레임의 헤더 타임스탬프 (epoch 초)
     double getLastFrameTime() const { return _lastFrameTime; }
 
+    // IMU→LiDAR 외부파라미터 회전 설정 (quat xyzw = R_imu_lidar, 캘리브의
+    // "lidar extrinsics, parent: imu" 값 그대로). IMU 샘플의 자이로/가속도를
+    // 라이다 좌표계로 회전시킨다 — 내장 IMU가 아닌 장비(축이 어긋난)에 필수.
+    void setImuRotation(double qx, double qy, double qz, double qw);
+
 private:
     std::string   _bagPath;
     std::string   _pointsTopic;
@@ -45,6 +50,8 @@ private:
     std::ifstream _file;
     int           _frameCount   = 0;
     double        _lastFrameTime = 0.0;  // 직전 프레임 헤더 stamp (TUM 궤적용)
+    bool          _hasImuRot = false;    // IMU→LiDAR 회전 적용 여부
+    double        _imuRot[9] = {1,0,0, 0,1,0, 0,0,1};  // R_lidar_imu (row-major)
     int           _connId       = -1;    // 라이다 토픽 connection ID
     int           _imuConnId    = -1;    // IMU 토픽 connection ID
 

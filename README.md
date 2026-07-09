@@ -27,7 +27,8 @@ ROS1 Bag
                                                 (신뢰도 가중 노이즈)
 
 옵션:
-  --imu    IMU 타이트커플링(LIO) 실험 경로 활성화 (안전 동작하나 맵 품질 낮음 — 봉인, 기본 비권장)
+  --imu    IMU 타이트커플링(LIO) 활성화. 외장 IMU 장비는 --imu-rot 필수 (아래 참조)
+  --imu-rot <qx,qy,qz,qw>  IMU→LiDAR 외부회전 (캘리브의 lidar extrinsics quat)
   기본값   타이트커플링 OFF (IMU는 회전 deskew 전용)
 
 PoseGraph 최적화 결과 ──→ MapBuilder ──→ output/slam_map.ply
@@ -245,6 +246,29 @@ IMU 노이즈는 FAST-LIVO2 avia 값(loose)을 사용합니다.
 추정(FAST-LIO식)하는 대공사가 필요하며, LiDAR가 강한 데이터에서는 보상이 없어
 **실험 기능으로 봉인**합니다. 재개 조건: LiDAR가 실제로 열화되는 데이터
 (빠른 모션, 좁은 FOV 복도 등)가 확보될 때.
+
+#### 봉인 해제 — `--imu-rot` 외부회전으로 명예회복 (Hilti 2021 실측)
+
+봉인의 진짜 원인이 밝혀졌습니다. 위 실험들은 **IMU 축 ≈ LiDAR 축**(내장 IMU)을
+암묵 전제했는데, 외장 IMU 장비(Hilti Phasma25: Alphasense IMU + PandarXT-32)는
+두 센서가 90° 돌아가고 뒤집혀 장착돼 있어 관성 정보가 통째로 오염됐습니다.
+
+`--imu-rot <qx,qy,qz,qw>`(캘리브의 lidar extrinsics 쿼터니언)로 IMU 샘플을
+LiDAR 축으로 회전시킨 뒤, GT 컨트롤 포인트 22개 대비 ATE:
+
+| 구성 | ATE 평균 | 최대 |
+|---|---|---|
+| 순수 LiDAR | 1.87m | 6.24m |
+| `--imu` (축 미보정) | 8.60m | 20.25m |
+| **`--imu --imu-rot`** | **1.23m** | **2.22m** |
+
+초반 헤딩 드리프트 스파이크(6.2m)가 IMU로 눌리며 **평균 34% 개선**.
+결론: IMU 통합 자체는 유효하며, 외장 IMU 장비에서는 `--imu-rot`이 필수입니다.
+
+```bash
+build/slam data.bag /hesai/pandar /alphasense/imu --imu \
+    --imu-rot 0.7071068,-0.7071068,0,0   # 캘리브 yaml의 quat 그대로
+```
 
 ---
 
